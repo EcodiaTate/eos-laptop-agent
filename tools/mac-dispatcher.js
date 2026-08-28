@@ -296,6 +296,93 @@ function composeBrief(opts) {
   return [header, '', identity, '', verifyFirst, '', standDown, '', taskBlock, '', selfContinuation, '', closing].join('\n')
 }
 
+// ── Stable tab id, stamped at spawn ──────────────────────────────────────────
+//
+// WHY THE DISPATCHER AND NOT signal_bound. coord._captureStableTabId resolves a
+// worker's tab by matching the spawn sentinel against live tab LABELS, on the
+// premise that bind is "the one moment the tab still shows its unique sentinel".
+// That premise is false for a recurring cron. The sentinel is derived from the
+// brief, a cron re-fires one brief verbatim, so when fires N-1 and N-2 are still
+// open, fire N is ambiguous AT BIND TIME, captures nothing, and is itself
+// unclosable. The leak is self-sustaining rather than decaying: the reaper
+// drains the backlog and the source refills it.
+//
+// The dispatcher does not have to match anything. It knows which tab it just
+// opened because it is standing on both sides of the open, so the identification
+// is unambiguous BY CONSTRUCTION rather than by luck. Snapshot the set of live
+// CC-chat ttab_ ids before ide.chat_send_message and again after; the single id
+// that appeared is ours. It never reads a label, so no number of same-sentinel
+// corpses can make it ambiguous, which is exactly the case that defeats bind.
+//
+// Cost measured 2026-08-29: ide.tabs() is 18ms and returned 61 of 61 CC chat
+// tabs carrying ids, so the pair adds about 36ms to a dispatch.
+//
+// SAFE BY OMISSION. Every failure returns no id and stamps nothing, leaving the
+// signal_bound capture to run exactly as it does today. This can withhold a
+// stamp; it cannot produce a wrong one, and a wrong one closes a live worker.
+// The id space is coord's own (_liveCcTabsWithIds), so capture and close still
+// speak one coordinate system.
+
+const _CC_CHAT_VIEW_TYPE = 'mainThreadWebview-claudeVSCodePanel'
+
+// Live CC-chat tabs carrying a bridge-minted ttab_ id. Delegates to coord so the
+// dispatcher and the close path cannot drift into two different id spaces.
+// Returns null (not []) when the bridge is unreachable, because "no snapshot"
+// and "no tabs" must not collapse into the same value: differencing against an
+// empty set would call every live tab new.
+async function _ccTabIdSnapshot() {
+  try {
+    const coord = require('./coord')
+    if (typeof coord._liveCcTabsWithIds !== 'function') return null
+    const tabs = await coord._liveCcTabsWithIds(undefined)
+    if (!Array.isArray(tabs)) return null
+    return tabs.filter((t) => t && t.tabId)
+  } catch (e) {
+    return null
+  }
+}
+
+// The set difference. Exactly one new id is the answer; anything else refuses.
+//
+// fresh > 1 means something else opened a chat inside our window. dispatchOne is
+// serial under the launch lock, so the realistic author is a human opening a tab
+// mid-dispatch. Narrowing by our own sentinel is a tiebreak ONLY, never the
+// primary key, so a same-sentinel corpse cannot re-enter the decision: a corpse
+// is not new, so it was already excluded by the id diff before any label is read.
+//
+// fresh === 0 does not prove no tab was created. assignStableTabIds reconciles a
+// tab to a prior id by (viewColumn, index), so a tab closing and ours opening at
+// the same slot inside our window would inherit the departed id. Rare, and the
+// consequence of treating it as "no tab" would be failing a dispatch that in fact
+// succeeded, so it declines to stamp and says why rather than raising an error.
+function _diffSpawnedCcTab(before, after, sentinel_prefix) {
+  if (!Array.isArray(before) || !Array.isArray(after)) {
+    return { ok: false, reason: 'no_snapshot' }
+  }
+  // EXACTLY ONE, or nothing. Confirmed with lane W1 2026-08-29: their orphan
+  // sweep Pass 0 has no fallthrough, so a row carrying a stored id that does not
+  // resolve is refused and leaked rather than handed back to the ladder. Before
+  // this stamp existed only 6 of 111 terminated rows carried an id and a bad one
+  // cost a single ghost. Once every new row carries one, a WRONG stamp is a
+  // permanently unreapable tab, which is the failure we are both here to kill.
+  // So every uncertain branch below leaves tabId unset and keeps the ladder.
+  const beforeIds = new Set(before.map((t) => t.tabId))
+  const fresh = after.filter((t) => !beforeIds.has(t.tabId))
+  if (fresh.length === 1) return { ok: true, tab: fresh[0], via: 'dispatch_spawn_diff' }
+  if (fresh.length === 0) {
+    return { ok: false, reason: 'no_new_tab_id', before: before.length, after: after.length }
+  }
+  let narrowed = []
+  try {
+    const coord = require('./coord')
+    if (sentinel_prefix && typeof coord._labelMatchesStored === 'function') {
+      narrowed = fresh.filter((t) => coord._labelMatchesStored(t.label, sentinel_prefix))
+    }
+  } catch (e) { narrowed = [] }
+  if (narrowed.length === 1) return { ok: true, tab: narrowed[0], via: 'dispatch_spawn_diff_sentinel' }
+  return { ok: false, reason: 'ambiguous_new_tabs', fresh: fresh.length, narrowed: narrowed.length }
+}
+
 async function dispatch_worker(params) {
   params = params || {}
   const account = params.account || 'current'
@@ -483,6 +570,10 @@ async function dispatch_worker(params) {
   let tab_handle = null
   let spawn_error = null
   let submit_path = null
+  // Snapshot the live CC-chat id set immediately before the open. Taken INSIDE
+  // the try so a bridge outage here fails the dispatch the same way the open
+  // itself would, rather than half-arming the diff.
+  const ccTabsBefore = await _ccTabIdSnapshot()
   try {
     const sendRes = await ide.chat_send_message({ prompt: composedBrief, submit: false })
     const inner = (sendRes && (sendRes.result || sendRes)) || {}
@@ -500,6 +591,42 @@ async function dispatch_worker(params) {
         autotitle_fingerprint,
         captured_via: 'bridge_chat_send_message',
         captured_label_is_provisional: true,
+      }
+    }
+    // Stamp the stable tab id from the spawn diff. This is the identification
+    // that a recurring cron cannot defeat, so it runs whenever a tab_handle
+    // exists, including when the bridge fell back to the active tab: the id is
+    // derived independently of the bridge's own label-keyed diff, and the close
+    // path reads viewColumn and index off the LIVE resolved tab rather than off
+    // this handle, so a correct id repairs a handle whose position is wrong.
+    if (tab_handle) {
+      const ccTabsAfter = await _ccTabIdSnapshot()
+      const spawned = _diffSpawnedCcTab(ccTabsBefore, ccTabsAfter, sentinel_prefix)
+      if (spawned.ok) {
+        tab_handle.tabId = spawned.tab.tabId
+        tab_handle.tabId_captured_at = new Date().toISOString()
+        tab_handle.tabId_captured_label = spawned.tab.label
+        tab_handle.tabId_captured_via = spawned.via
+      } else {
+        // No id. coord._captureStableTabId at signal_bound still runs its own
+        // capture unchanged, so this is a missing improvement, not a regression.
+        tab_handle.tabId_spawn_diff_declined = spawned.reason
+      }
+      // DIAGNOSTIC ONLY, deliberately changing no behaviour this pass. The
+      // bridge's /ide/chat/send_message keys its own new-tab diff on
+      // viewColumn + '|' + label, so fire N of a cron whose fire N-1 corpse is
+      // still open is filtered out as already-seen and it falls through to
+      // `active_fallback`, which picks whichever CC chat is ACTIVE. That is how
+      // a dispatch can register a worker whose stored position points at the
+      // conductor's own tab. Recording it makes the size of that population
+      // measurable for the first time; correcting the submit target is a
+      // separate change against the most load-bearing path in the fleet and
+      // wants its own evidence before it ships.
+      if (ot && ot.via) tab_handle.bridge_opened_via = ot.via
+      if (spawned.ok && ot && typeof ot.viewColumn === 'number'
+          && spawned.tab.viewColumn !== ot.viewColumn) {
+        tab_handle.bridge_position_disagrees = 'bridge_vc=' + ot.viewColumn
+          + ' spawn_diff_vc=' + spawned.tab.viewColumn
       }
     }
     // Submit step. The bridge has populated the textarea; the 1200ms settle
@@ -732,6 +859,11 @@ module.exports = {
   // BECAUSE it lives in here, so a test has to be able to assert on the composed
   // brief directly rather than trust that callers remember it.
   _composeBrief: composeBrief,
+  // Exposed for tests only: the spawn-diff is the half of the tab-leak fix that
+  // a recurring cron cannot defeat, and its whole safety argument is which
+  // states it REFUSES, so those refusals have to be assertable directly.
+  _ccTabIdSnapshot: _ccTabIdSnapshot,
+  _diffSpawnedCcTab: _diffSpawnedCcTab,
   kill_worker: cowork.kill_worker,
   cleanup_orphan_workers: cowork.cleanup_orphan_workers,
   list_workers: cowork.list_workers,

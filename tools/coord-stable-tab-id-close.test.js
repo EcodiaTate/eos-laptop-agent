@@ -263,6 +263,137 @@ function setTabId(tab_id, ttab) {
   ok('and no id was written onto the refusing row',
     !coord.loadWorkerRegistry('tab_fireC').tab_handle.tabId)
 
+
+  console.log('\n== Part 8: the BOOTSTRAP state. Fire N binds while fires N-1 and N-2 are still open ==')
+  //
+  // WHY THIS CASE AND NOT THE ONE ABOVE. Part 3 proves capture survives ONE
+  // corpse whose id is already claimed. That is the steady state AFTER the fix
+  // has been running. It is not the state production is in.
+  //
+  // Production entered the fix with a backlog: 78 tabs at the 2026-08-29 count,
+  // accreted by fires that predate the fix and therefore hold NO id. An
+  // unclaimed corpse cannot be excluded by _claimedStableTabIds, so with two of
+  // them the sentinel resolves 3 ways, capture refuses, fire N gets no id, and
+  // fire N is now itself an unclaimed corpse poisoning fire N+1. The leak is
+  // self-sustaining rather than decaying, which is why the one-shot reaper drained
+  // 78 to 47 and the count was back to 62 by the next morning.
+  //
+  // The dispatcher-side spawn diff is what breaks that cycle, because it never
+  // reads a label: it stands on both sides of the open and takes the id that
+  // appeared, so no quantity of same-sentinel corpses is even a candidate.
+  const dispatcher = require('./mac-dispatcher')
+  const CRON = '[9f2a bootstrap cron lane B1 hourly]'
+  const CRON_TRUNC = '[9f2a bootstrap cron l…'
+
+  const mkFire = (tab_id) => {
+    coord._registerWorkerInternal({ tab_id: tab_id, task_id: 'bootstrap-cron-row', tab_credential: 'c-' + tab_id })
+    coord.setWorkerTabHandle(tab_id, {
+      sentinel_prefix: CRON, viewColumn: 1, viewType: CC,
+      label_at_spawn: 'Claude Code', tabIndex: 0,
+    })
+  }
+
+  // Fires 1 and 2 leaked BEFORE the fix existed, so neither row carries an id.
+  mkFire('tab_boot_f1')
+  mkFire('tab_boot_f2')
+  mkFire('tab_boot_f3')
+
+  const bootBefore = [
+    { tabId: 'ttab_boot1', label: CRON_TRUNC, viewColumn: 1, index: 0 },
+    { tabId: 'ttab_boot2', label: CRON_TRUNC, viewColumn: 1, index: 1 },
+  ]
+  const bootAfter = bootBefore.concat([
+    { tabId: 'ttab_boot3', label: CRON_TRUNC, viewColumn: 1, index: 2 },
+  ])
+
+  // 4a. THE HOLE, stated as an assertion rather than a comment. This is the
+  //     production state and bind-time capture cannot resolve it.
+  LIVE_TABS = bootAfter.map((t) => ({ tabId: t.tabId, label: t.label }))
+  const bootCap = await coord._captureStableTabId('tab_boot_f3')
+  ok('BOOTSTRAP HOLE: with two UNCLAIMED corpses, bind-time capture refuses',
+    bootCap.ok === false && bootCap.reason === 'ambiguous_sentinel', JSON.stringify(bootCap))
+  ok('and fire N is left with no id, so it becomes the next fire poison',
+    !coord.loadWorkerRegistry('tab_boot_f3').tab_handle.tabId)
+
+  // 4b. THE FIX. Same fixture, dispatcher side. One new id appeared.
+  const spawned = dispatcher._diffSpawnedCcTab(bootBefore, bootAfter, CRON)
+  ok('SPAWN DIFF resolves fire N in the exact state that defeats capture',
+    spawned.ok === true && spawned.tab.tabId === 'ttab_boot3' && spawned.via === 'dispatch_spawn_diff',
+    JSON.stringify(spawned))
+
+  // 4c. The diff is LABEL-INDEPENDENT, which is the whole point. Claude Code has
+  //     already retitled the new tab to the same summary as both corpses, so
+  //     there is no label in this fixture that could pick it out.
+  const retitled = [
+    { tabId: 'ttab_boot1', label: 'Bootstrap cron hourly…' },
+    { tabId: 'ttab_boot2', label: 'Bootstrap cron hourly…' },
+    { tabId: 'ttab_boot3', label: 'Bootstrap cron hourly…' },
+  ]
+  const spawnedRetitled = dispatcher._diffSpawnedCcTab(
+    retitled.slice(0, 2), retitled, CRON)
+  ok('SPAWN DIFF still resolves when all three tabs share one autotitle',
+    spawnedRetitled.ok === true && spawnedRetitled.tab.tabId === 'ttab_boot3',
+    JSON.stringify(spawnedRetitled))
+
+  // 4d. Once the dispatcher has stamped, bind-time capture stops guessing and
+  //     short-circuits on the stored id. This is the handoff between the two
+  //     halves and it is what makes the sentinel ladder dead code for crons.
+  const w3 = coord.loadWorkerRegistry('tab_boot_f3')
+  w3.tab_handle.tabId = spawned.tab.tabId
+  coord.setWorkerTabHandle('tab_boot_f3', w3.tab_handle)
+  const bootCap2 = await coord._captureStableTabId('tab_boot_f3')
+  ok('after the spawn stamp, capture short-circuits instead of refusing',
+    bootCap2.ok === true && bootCap2.tabId === 'ttab_boot3' && bootCap2.reason === 'already_set',
+    JSON.stringify(bootCap2))
+
+  // 4e. And the close now resolves, which is the outcome the whole chain exists
+  //     for. Without the stamp this row had no id at all and fell to the
+  //     colliding legacy ladder.
+  const bootResolved = await coord._resolveStableIdCloseTarget('tab_boot_f3', 65535)
+  ok('close resolves fire N to its own tab, not a corpse',
+    !!bootResolved.tab && bootResolved.tabId === 'ttab_boot3', JSON.stringify(bootResolved))
+
+  // 4f. CONTROL, and it has to be here or 4b proves only that a set difference
+  //     works. Two tabs appear inside the dispatch window (a human opened a chat
+  //     while the cron was spawning) and neither carries our sentinel, so the
+  //     tiebreak cannot pick and the diff REFUSES rather than taking the first.
+  const twoNew = bootBefore.concat([
+    { tabId: 'ttab_boot3', label: 'Some human chat' },
+    { tabId: 'ttab_human', label: 'Another human chat' },
+  ])
+  const amb = dispatcher._diffSpawnedCcTab(bootBefore, twoNew, CRON)
+  ok('CONTROL: two unattributable new tabs REFUSE rather than guess',
+    amb.ok === false && amb.reason === 'ambiguous_new_tabs' && amb.fresh === 2,
+    JSON.stringify(amb))
+
+  // 4g. The tiebreak, and note it can only ever narrow tabs that are ALREADY new.
+  //     A same-sentinel corpse is not new, so it was excluded before any label
+  //     was read; that ordering is what stops the tiebreak reintroducing the very
+  //     collision the diff exists to avoid.
+  const twoNewOneOurs = bootBefore.concat([
+    { tabId: 'ttab_human', label: 'Another human chat' },
+    { tabId: 'ttab_boot3', label: CRON_TRUNC },
+  ])
+  const tie = dispatcher._diffSpawnedCcTab(bootBefore, twoNewOneOurs, CRON)
+  ok('tiebreak picks OUR new tab when a human tab opened in the same window',
+    tie.ok === true && tie.tab.tabId === 'ttab_boot3' && tie.via === 'dispatch_spawn_diff_sentinel',
+    JSON.stringify(tie))
+
+  // 4h. FAIL-SAFE. A bridge outage gives no snapshot. "No snapshot" must not
+  //     collapse into "no tabs", because differencing against an empty set calls
+  //     every live tab new and would stamp a stranger's id onto this worker.
+  const noSnap = dispatcher._diffSpawnedCcTab(null, bootAfter, CRON)
+  ok('FAIL-SAFE: a missing before-snapshot refuses, never treats all tabs as new',
+    noSnap.ok === false && noSnap.reason === 'no_snapshot', JSON.stringify(noSnap))
+
+  // 4i. And the reconcile edge: assignStableTabIds matches a tab to a prior id by
+  //     (viewColumn, index), so a tab closing as ours opens at the same slot can
+  //     hand ours the departed id and the diff sees nothing new. It declines and
+  //     names the reason; it must NOT fail the dispatch, which did succeed.
+  const noNew = dispatcher._diffSpawnedCcTab(bootAfter, bootAfter, CRON)
+  ok('a reconciled id yields no new tab, declines cleanly rather than throwing',
+    noNew.ok === false && noNew.reason === 'no_new_tab_id', JSON.stringify(noNew))
+
   ide.tabs = realTabs
   ide.tabs_close = realClose
   console.log('\n' + (fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'))
