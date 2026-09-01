@@ -91,6 +91,67 @@ const DEFAULT_WAKE_POLICY = Object.freeze({
   rate_limit_ms: 2000,                 // suppress consecutive wakes within this window
 })
 
+// THE WAKE TEST IS A DENYLIST (inverted 2026-09-02, lane D1). It used to be a
+// closed allowlist: notify_types named what may wake, and everything else was
+// dropped in silence. That shape cannot hold, because the fleet invents type
+// names faster than any list is maintained and every invention is somebody
+// meaning "wake up". Measured over 14d on 2026-09-01: 58 lost across 15 known
+// types plus 29 one-off inventions, every one a real escalation (blocked,
+// alert, escalation, merge_ready, blocked_need_tate, guardrail_flag,
+// orphan_audit_escalation, handover). Two more were still being lost the day
+// this landed: comms_health_surface from gmail-inbox-poll and
+// conductor_lane_surface from status-board-execute-top, both dropped silently
+// on 2026-09-01. The send returns ok:true, the message persists, and
+// last_wake_result records skipped=policy_filtered. Nothing wakes.
+//
+// So the DEFAULT IS NOW WAKE and this set is the only thing that silences.
+// Adding a name here is a deliberate claim that no human ever needs to see it.
+// Each entry carries the count over 14d that earned it, measured 2026-09-01.
+//
+// notify_types:["*"] is NOT the equivalent shortcut and was rejected on
+// evidence: a sandbox policy of ["*"] wakes on ALL 7660 conductor-bound
+// messages including 3065 bound and 2808 done, which is strictly worse than
+// the bug it would be replacing.
+const MACHINE_CHATTER = new Set([
+  'bound',           // 3065 - worker acknowledging its brief
+  'done',            // 2808 - legacy completion notice, superseded by the row write
+  'progress',        // 254  - mid-run status, floods by design
+  'account_switch',  // 18   - credential rotation telemetry
+])
+
+// The evidentiary floor for membership, recorded so a future edit has to argue
+// with a number. The smallest existing entry is account_switch at 18. Of the 44
+// type names the live policy was filtering on 2026-09-02, ZERO cleared n>=18
+// (32 were n=1, the largest was `escalation` at 16), which is why nothing was
+// added to the set above when it was built.
+const MACHINE_CHATTER_EVIDENCE_FLOOR = 18
+
+// A denylist can silence the fleet exactly as dead as the allowlist did, by one
+// careless entry. These four can never be chatter: worker_report is how a worker
+// finishing reaches a human, error is how anything failing does, and the two
+// inbound_* types are Tate talking to us. Asserted at load so a bad edit fails
+// loudly here rather than silently at 3am.
+for (const _reserved of ['worker_report', 'error', 'inbound_sms', 'inbound_telegram']) {
+  if (MACHINE_CHATTER.has(_reserved)) {
+    throw new Error('coord.js: MACHINE_CHATTER must never contain ' + _reserved
+      + ' - silencing it blinds the whole fleet. See shouldWake().')
+  }
+}
+
+// THE GREPPABLE CONTRACT with backend/scripts/coord-wake-policy-reachability-scan.cjs.
+//
+// That scanner models shouldWake() AS DEPLOYED. While the model was hand-kept,
+// the two had to be flipped in the same change or the detector read confidently
+// wrong in the other direction, reporting loss that the live code no longer
+// caused. A coupling that depends on someone remembering is the same class of
+// defect as the allowlist itself, so the scanner now PROBES this constant in the
+// deployed source instead of carrying a copy of the answer. A build with no such
+// constant is the pre-fix allowlist build, which is exactly what the scanner
+// assumes when the probe finds nothing.
+//
+// If you change the shape of shouldWake(), change this string in the same edit.
+const SHOULD_WAKE_SHAPE = 'denylist'
+
 // 2026-05-18: conductor freshness threshold. A conductor whose last_seen_at
 // is older than this is treated as gone - inbound webhooks fall back to
 // reflex.fire (cold spawn) rather than coord-routing into a dead tab.
@@ -361,29 +422,33 @@ function isWakeTopic(topic) {
 function shouldWake(msg, policy) {
   if (!isWakeTopic(msg.to)) return false
   if (policy.mode === 'silent') return false
-  const types = policy.notify_types || ['worker_report', 'done', 'error']
+  const types = policy.notify_types || DEFAULT_WAKE_POLICY.notify_types
   if (types.indexOf('*') !== -1) return true
   const t = (msg.body && typeof msg.body === 'object') ? msg.body.type : null
-  if (!t) return false  // body has no type field - don't wake (free-form messages are noise)
+
+  // UNCHANGED CARVE-OUT 1. A body with no type field cannot wake. Free-form
+  // messages are noise, and this is tested before any list is consulted, so it
+  // survives the inversion untouched. 0 of 7660 in-window messages hit it.
+  if (!t) return false
+
+  // An explicit subscription always wins, and is checked BEFORE the chatter set
+  // so a policy that deliberately asks for 'bound' still gets it.
   if (types.indexOf(t) !== -1) return true
-  // 2026-08-28 lane R1 item 2. THE DEFAULT IS NOT ENOUGH, and this line is the
-  // difference between the migration working and silently killing the wake.
-  //
-  // loadWakePolicy does Object.assign({}, DEFAULT_WAKE_POLICY, onDisk), so an
-  // on-disk policy REPLACES notify_types wholesale rather than merging into it.
-  // One exists: ~/.ecodiaos/coordination/wake_policy.json, written 2026-08-27,
-  // carrying exactly ["done","error"] <!-- probed this arc -->. Adding
-  // 'worker_report' to the default therefore changes nothing on this machine.
-  // signal_done would post a worker_report, this function would find no match,
-  // and wake-on-worker-finish would die SILENTLY - the precise regression the
-  // notice was kept to prevent, arriving through config rather than code.
-  //
-  // So a policy that asks to be woken on a worker finishing is honoured whatever
-  // the era of its vocabulary. Deliberately one-way: worker_report satisfies a
-  // 'done' subscription, never the reverse, because the ~2,568 historical `done`
-  // messages must not start waking a policy that never asked for them.
+
+  // UNCHANGED CARVE-OUT 2, and deliberately ONE-WAY. A policy that asks to be
+  // woken on a worker finishing is honoured whatever the era of its vocabulary,
+  // because loadWakePolicy REPLACES notify_types wholesale rather than merging,
+  // so an on-disk policy written in the 'done' era would otherwise never see a
+  // worker_report. Never the reverse: the ~2568 historical `done` messages must
+  // not start waking a policy that never asked for them, which is also why
+  // 'done' sits in MACHINE_CHATTER below.
   if (t === 'worker_report' && types.indexOf('done') !== -1) return true
-  return false
+
+  // THE INVERSION. Routine fleet chatter is silenced by name; everything else
+  // wakes. An unrecognised type is somebody's invented escalation vocabulary,
+  // and there is no list that keeps up with invention.
+  if (MACHINE_CHATTER.has(t)) return false
+  return true
 }
 
 // Is this message a WORKER LIFECYCLE BROADCAST into the singleton conductor slot?
