@@ -303,13 +303,154 @@ exports._setDispatcher = function (d) { _dispatcher = d }
 const fs = require('fs')
 const path = require('path')
 
+// ── target repo resolution (2026-09-02, status_board b686e9c8 / postmortem L3) ─
+//
+// Before this, every dispatch worktree was allocated off SHARED_TREE, which is
+// hardcoded to ecodiaos-backend. A task targeting any OTHER repo got a worktree
+// containing none of the code it was told to edit, abandoned it, and worked
+// directly on that repo's live main checkout, which is exactly where a
+// concurrent worker's uncommitted WIP lives. Isolation was defeated for every
+// cross-repo dispatch and the only thing standing between two workers was one
+// of them choosing explicit-path `git add`. Measured cluster
+// dispatch-worktree-wrong-repo-forces-shared-tree-collision, session b25ce101,
+// frequency 2, both NOT_CAUGHT. Doctrine:
+// ecodiaos/backend/patterns/dispatch-worktree-must-branch-off-task-target-repo-2026-08-20.md
+//
+// os_scheduled_tasks has NO target_repo column (probed 2026-09-02: 44 columns,
+// none of them target_repo), and the conductor's schedule_delayed is served by a
+// REMOTE scheduler.js we cannot edit, so a migration alone would not reach rows
+// inserted through the MCP. The resolution order therefore mirrors the existing
+// REPORT-BACK: directive convention, which already survives that same remote
+// insert path:
+//   1. row.target_repo          (a future column, or a caller passing it directly)
+//   2. a line-anchored TARGET_REPO: <abs path> directive in the prompt
+//   3. SHARED_TREE              (unchanged default; the common case is untouched)
+//
+// VALIDATION IS NOT OPTIONAL. row.prompt carries ingested external text on some
+// rows, so the directive is an injection surface: it is matched only at line
+// start, must be an absolute path under CODE_ROOT, may not contain a '..'
+// segment, must exist, and must actually be a git repository. Anything else is
+// a LOUD stderr line and a fall back to SHARED_TREE, never a silent honour.
+const CODE_ROOT = process.env.SCHEDULER_CODE_ROOT || '/Users/ecodia/.code'
+const TARGET_REPO_DIRECTIVE = /^[ \t]*TARGET_REPO:[ \t]*(\S+)[ \t]*$/m
+
+// macOS resolves /var to /private/var, and git writes the REALPATH into a linked
+// worktree's .git file. So a repo path that reached us through a symlinked
+// ancestor compares unequal to the same repo read back off disk, which would
+// silently disable the doctrine-harvest gate below (it would read a shared-tree
+// prune as a foreign one and skip the harvest). Compare on realpath, falling
+// back to the literal string when the path is already gone.
+function realish(p) {
+  try { return fs.realpathSync(p) } catch (_e) { return p }
+}
+function sameRepo(a, b) {
+  if (!a || !b) return false
+  return a === b || realish(a) === realish(b)
+}
+
+function isGitRepo(p) {
+  try {
+    // A normal repo has a .git DIRECTORY; a linked worktree has a .git FILE.
+    // Both are legitimate allocation bases, so test existence, not type.
+    return fs.existsSync(path.join(p, '.git'))
+  } catch (_e) { return false }
+}
+
+// Returns { repo, source, rejected }. `source` is one of 'row' | 'prompt' |
+// 'default'; `rejected` names the candidate that failed validation, so the
+// caller can log WHY it fell back rather than reporting a clean default.
+exports.resolveTargetRepo = function resolveTargetRepo(row) {
+  const fallback = { repo: SHARED_TREE, source: 'default', rejected: null }
+  if (!row) return fallback
+
+  let candidate = null
+  let source = null
+  if (typeof row.target_repo === 'string' && row.target_repo.trim()) {
+    candidate = row.target_repo.trim()
+    source = 'row'
+  } else if (typeof row.prompt === 'string') {
+    const m = TARGET_REPO_DIRECTIVE.exec(row.prompt)
+    if (m) { candidate = m[1].trim(); source = 'prompt' }
+  }
+  if (!candidate) return fallback
+
+  const reject = (why) => {
+    process.stderr.write('[scheduler] target_repo REJECTED (' + why + '): ' +
+      JSON.stringify(candidate) + ' from ' + source + ' on row ' +
+      ((row && row.id) || 'unknown') + '; allocating off ' + SHARED_TREE + ' instead\n')
+    return { repo: SHARED_TREE, source: 'default', rejected: candidate }
+  }
+
+  if (!path.isAbsolute(candidate)) return reject('not an absolute path')
+  if (candidate.split(path.sep).includes('..')) return reject('contains a .. segment')
+  const norm = path.normalize(candidate).replace(/\/+$/, '')
+  if (norm !== CODE_ROOT && !norm.startsWith(CODE_ROOT + path.sep)) {
+    return reject('outside ' + CODE_ROOT)
+  }
+  if (!fs.existsSync(norm)) return reject('does not exist')
+  if (!isGitRepo(norm)) return reject('not a git repository')
+  return { repo: norm, source, rejected: null }
+}
+
+// Which repo OWNS a given worktree path, read off disk rather than off the row.
+//
+// The prune and reap paths must know the owning repo of a directory they are
+// about to destroy, and the row is the wrong place to ask: reapOrphanWorktrees
+// walks WORKTREE_ROOT with only directory names, and a row's prompt can be
+// edited between allocation and prune. A linked worktree's .git is a FILE
+// reading `gitdir: <repo>/.git/worktrees/<name>`, which is ground truth for as
+// long as the worktree is registered. Returns null when the path is not a
+// linked worktree (an unregistered leftover dir), which every caller treats as
+// "preserve, do not touch".
+exports.repoForWorktreePath = function repoForWorktreePath(wtPath) {
+  try {
+    const dotGit = path.join(wtPath, '.git')
+    if (!fs.existsSync(dotGit) || !fs.statSync(dotGit).isFile()) return null
+    const txt = fs.readFileSync(dotGit, 'utf8').trim()
+    const m = /^gitdir:\s*(.+)$/m.exec(txt)
+    if (!m) return null
+    const gitdir = m[1].trim()
+    const marker = path.sep + '.git' + path.sep + 'worktrees' + path.sep
+    const i = gitdir.indexOf(marker)
+    if (i === -1) return null
+    return gitdir.slice(0, i)
+  } catch (_e) { return null }
+}
+
+// Base ref for the allocation. origin/main FIRST so ecodiaos-backend behaviour is
+// byte-identical; the fallbacks only fire where the previous code would have
+// thrown outright, which is every repo that does not happen to publish
+// origin/main. Doctrine special case (target_ref for doctrine crons, which need
+// the conductor branch rather than origin/main) is NOT covered here and stays
+// queued on b686e9c8.
+async function resolveBaseRef(repo) {
+  for (const ref of ['origin/main', 'origin/master', 'origin/HEAD', 'HEAD']) {
+    const ok = await runGit(['rev-parse', '--verify', '--quiet', ref + '^{commit}'], repo)
+      .then(r => !!String((r && r.stdout) || '').trim()).catch(() => false)
+    if (ok) return ref
+  }
+  return 'origin/main'
+}
+
 async function defaultAllocateWorktreeForRow(row) {
+  const resolved = exports.resolveTargetRepo(row)
+  const repo = resolved.repo
+  if (resolved.source !== 'default') {
+    process.stderr.write('[scheduler] worktree base repo for row ' + row.id + ': ' +
+      repo + ' (from ' + resolved.source + ')\n')
+  }
+
   const wtPath = path.join(WORKTREE_ROOT, String(row.id))
   fs.mkdirSync(path.dirname(wtPath), { recursive: true })
 
-  // Idempotent cleanup: forget any stale worktree at that path first.
-  await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
-  await runGit(['worktree', 'prune']).catch(() => {})
+  // Idempotent cleanup: forget any stale worktree at that path first. The stale
+  // entry may belong to a DIFFERENT repo than the one we are about to allocate
+  // from (a row whose target changed between dispatches), so ask the directory
+  // itself who owns it and forget it there; the resolved repo is only the
+  // fallback when the path is not a registered worktree.
+  const priorRepo = exports.repoForWorktreePath(wtPath) || repo
+  await runGit(['worktree', 'remove', '--force', wtPath], priorRepo).catch(() => {})
+  await runGit(['worktree', 'prune'], priorRepo).catch(() => {})
 
   // 2026-06-20: `worktree remove --force` is a silent no-op when the path
   // exists on disk but is no longer a REGISTERED worktree (crashed prior
@@ -323,11 +464,11 @@ async function defaultAllocateWorktreeForRow(row) {
   // is dead); scoped strictly under WORKTREE_ROOT as a safety bound.
   if (fs.existsSync(wtPath) && wtPath.startsWith(WORKTREE_ROOT + path.sep)) {
     fs.rmSync(wtPath, { recursive: true, force: true })
-    await runGit(['worktree', 'prune']).catch(() => {})
+    await runGit(['worktree', 'prune'], priorRepo).catch(() => {})
   }
 
-  // Refresh origin/main so the worktree branches off recent base.
-  await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
+  // Refresh the remote so the worktree branches off a recent base.
+  await runGit(['fetch', 'origin', 'main', '--quiet'], repo).catch(() => {})
 
   const branchName = 'worker/' + String(row.id)
 
@@ -345,24 +486,33 @@ async function defaultAllocateWorktreeForRow(row) {
   // Failure never blocks the allocation, for the same reason it never blocks the
   // prune: a worker that cannot start is a worse outcome than doctrine that stays
   // stranded one more cycle.
-  try {
-    const { harvestDoctrine } = require('./doctrine-harvest')
-    const res = await harvestDoctrine({
-      sharedTree: SHARED_TREE,
-      branch: branchName,
-      rowId: String(row.id),
-    })
-    if (res && res.landed && res.landed.length) {
-      process.stderr.write('[scheduler] doctrine-harvest (pre-realloc): rescued ' +
-        res.landed.length + ' pattern file(s) from ' + (res.branch || branchName) +
-        ' before -B reset it\n')
+  //
+  // SHARED_TREE ONLY. harvestDoctrine reads and writes the `patterns/` corpus,
+  // which lives in ecodiaos-backend and nowhere else; pointing it at a foreign
+  // repo would either fail on a missing patterns/ dir or, worse, commit a
+  // pattern file into a client repo. A cross-repo worker's doctrine is surfaced
+  // through its pushed branch instead.
+  if (sameRepo(repo, SHARED_TREE)) {
+    try {
+      const { harvestDoctrine } = require('./doctrine-harvest')
+      const res = await harvestDoctrine({
+        sharedTree: SHARED_TREE,
+        branch: branchName,
+        rowId: String(row.id),
+      })
+      if (res && res.landed && res.landed.length) {
+        process.stderr.write('[scheduler] doctrine-harvest (pre-realloc): rescued ' +
+          res.landed.length + ' pattern file(s) from ' + (res.branch || branchName) +
+          ' before -B reset it\n')
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] doctrine-harvest (pre-realloc) failed for ' + row.id +
+        ': ' + (e && e.message || e) + ' (allocating anyway)\n')
     }
-  } catch (e) {
-    process.stderr.write('[scheduler] doctrine-harvest (pre-realloc) failed for ' + row.id +
-      ': ' + (e && e.message || e) + ' (allocating anyway)\n')
   }
 
-  await runGit(['worktree', 'add', '-B', branchName, wtPath, 'origin/main'])
+  const baseRef = await resolveBaseRef(repo)
+  await runGit(['worktree', 'add', '-B', branchName, wtPath, baseRef], repo)
   return wtPath
 }
 
@@ -380,26 +530,32 @@ async function defaultAllocateWorktreeForRow(row) {
 // move HEAD nor write into any working tree. Failure NEVER blocks the prune.
 async function defaultPruneWorktreeForRow(row) {
   const wtPath = path.join(WORKTREE_ROOT, String(row.id))
-  try {
-    const { harvestDoctrine } = require('./doctrine-harvest')
-    const res = await harvestDoctrine({
-      sharedTree: SHARED_TREE,
-      branch: 'worker/' + String(row.id),
-      rowId: String(row.id),
-    })
-    if (res && res.landed && res.landed.length) {
-      process.stderr.write('[scheduler] doctrine-harvest: landed ' + res.landed.length +
-        ' pattern file(s) on main from worker/' + row.id + ' (' + res.commit + ')\n')
+  // Owning repo comes off DISK, not off the row: the row's prompt can be edited
+  // between allocation and prune, and a `worktree remove` aimed at the wrong
+  // repo is a silent no-op that leaks the directory forever.
+  const repo = exports.repoForWorktreePath(wtPath) || exports.resolveTargetRepo(row).repo
+  if (sameRepo(repo, SHARED_TREE)) {
+    try {
+      const { harvestDoctrine } = require('./doctrine-harvest')
+      const res = await harvestDoctrine({
+        sharedTree: SHARED_TREE,
+        branch: 'worker/' + String(row.id),
+        rowId: String(row.id),
+      })
+      if (res && res.landed && res.landed.length) {
+        process.stderr.write('[scheduler] doctrine-harvest: landed ' + res.landed.length +
+          ' pattern file(s) on main from worker/' + row.id + ' (' + res.commit + ')\n')
+      }
+    } catch (e) {
+      process.stderr.write('[scheduler] doctrine-harvest failed for ' + row.id + ': ' +
+        (e && e.message || e) + ' (pruning anyway)\n')
     }
-  } catch (e) {
-    process.stderr.write('[scheduler] doctrine-harvest failed for ' + row.id + ': ' +
-      (e && e.message || e) + ' (pruning anyway)\n')
   }
-  await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
-  await runGit(['worktree', 'prune']).catch(() => {})
+  await runGit(['worktree', 'remove', '--force', wtPath], repo).catch(() => {})
+  await runGit(['worktree', 'prune'], repo).catch(() => {})
 }
 
-async function runGit(args) {
+async function runGit(args, repo) {
   // ECODIAOS_BRANCH_OK=1 is load-bearing here, not future-proofing.
   // Measured 2026-08-27 on git 2.50.1: allocating a worktree from the shared
   // tree DOES open a HEAD ref update on the shared tree itself (ref=HEAD,
@@ -412,8 +568,13 @@ async function runGit(args) {
   // the invoking command, so the manual path works too; this stays as the
   // explicit, process-independent guarantee for the dispatcher.
   // Doctrine: ecodiaos/backend/patterns/branch-thrash-guard-on-shared-tree-2026-06-10.md
+  //
+  // 2026-09-02: `repo` defaults to SHARED_TREE so every pre-existing call site
+  // is byte-identical. It is the single choke point for cross-repo allocation,
+  // which is why the target resolution feeds it rather than each call rebuilding
+  // an argv.
   const env = Object.assign({}, process.env, { ECODIAOS_BRANCH_OK: '1' })
-  return execFileP('git', ['-C', SHARED_TREE].concat(args), {
+  return execFileP('git', ['-C', repo || SHARED_TREE].concat(args), {
     timeout: WORKTREE_GIT_TIMEOUT_MS,
     env,
   })
@@ -1155,6 +1316,8 @@ exports.buildBrief = function buildBrief(row) {
   // shared tree's .git/hooks/reference-transaction is the backstop if the
   // worker still tries.
   if (row.worktree_path) {
+    const briefSharedTree = row.target_repo_resolved ||
+      (exports.resolveTargetRepo ? exports.resolveTargetRepo(row).repo : SHARED_TREE)
     lines.push(
       'WORKTREE: ' + row.worktree_path,
       '',
@@ -1163,11 +1326,15 @@ exports.buildBrief = function buildBrief(row) {
       '  git -C ' + row.worktree_path + ' ...',
       'or by first changing into that directory.',
       '',
-      'Do NOT operate on /Users/ecodia/.code/ecodiaos/backend - that is the',
-      "conductor's shared working tree and its reference-transaction hook will",
-      'reject branch flips there (see backend/patterns/branch-thrash-guard-on-',
-      'shared-tree-2026-06-10.md). The dispatcher prunes this worktree on your',
-      'signal_done.',
+      // 2026-09-02: generated from the RESOLVED base repo, not hardcoded. A
+      // cross-repo dispatch used to be told to avoid ecodiaos-backend while its
+      // real collision hazard was the target repo's own live checkout, which the
+      // brief never named, so the worker walked straight onto it.
+      'Do NOT operate on ' + briefSharedTree + ' - that is the',
+      'shared working tree its worktree was cut from, and a shared tree with a',
+      'reference-transaction hook will reject branch flips there (see',
+      'backend/patterns/branch-thrash-guard-on-shared-tree-2026-06-10.md). The',
+      'dispatcher prunes this worktree on your signal_done.',
       '',
     )
   }
@@ -1992,6 +2159,7 @@ exports.dispatchOne = async function dispatchOne(row) {
     // and the reference-transaction hook on the shared tree is the runtime
     // backstop in that case.
     let worktreePath = null
+    const targetRepoResolved = exports.resolveTargetRepo(row).repo
     try {
       worktreePath = await exports.allocateWorktreeForRow(row)
     } catch (e) {
@@ -1999,7 +2167,11 @@ exports.dispatchOne = async function dispatchOne(row) {
     }
 
     // 2. Build brief with actual_account + worktree_path filled in.
-    const rowWithAccount = Object.assign({}, row, { actual_account: account, worktree_path: worktreePath })
+    const rowWithAccount = Object.assign({}, row, {
+      actual_account: account,
+      worktree_path: worktreePath,
+      target_repo_resolved: targetRepoResolved,
+    })
     let brief = exports.buildBrief(rowWithAccount)
 
     // 2b. Report-back default-on (2026-08-13). ensureReportBackDefault normally
@@ -4096,14 +4268,27 @@ exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
     return tally
   }
 
-  await runGit(['fetch', 'origin', 'main', '--quiet']).catch(() => {})
-  const registered = new Set()
-  try {
-    const out = await runGit(['worktree', 'list', '--porcelain'])
-    for (const line of String((out && out.stdout) || out || '').split('\n')) {
-      if (line.startsWith('worktree ')) registered.add(line.slice('worktree '.length).trim())
-    }
-  } catch (_e) {}
+  // 2026-09-02 cross-repo sweep. A dispatch worktree can now be allocated off a
+  // repo other than SHARED_TREE, and it still lives under WORKTREE_ROOT. Reading
+  // the registered set from SHARED_TREE alone made every foreign worktree look
+  // unregistered, which the loop below reads as "preserve" - fail-safe, but it
+  // leaks the directory forever, which is the exact 5.0 GB leak this sweep
+  // exists to stop. So resolve each dir's OWNING repo off disk and keep a
+  // per-repo registered set, built at most once per repo per pass.
+  const registeredByRepo = new Map()
+  async function registeredFor(repo) {
+    if (registeredByRepo.has(repo)) return registeredByRepo.get(repo)
+    const set = new Set()
+    await runGit(['fetch', 'origin', 'main', '--quiet'], repo).catch(() => {})
+    try {
+      const out = await runGit(['worktree', 'list', '--porcelain'], repo)
+      for (const line of String((out && out.stdout) || out || '').split('\n')) {
+        if (line.startsWith('worktree ')) set.add(line.slice('worktree '.length).trim())
+      }
+    } catch (_e) {}
+    registeredByRepo.set(repo, set)
+    return set
+  }
 
   const pool = getPool()
   for (const id of entries) {
@@ -4128,8 +4313,13 @@ exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
 
     // Safe-to-drop: registered + branch merged + working tree clean. Anything
     // else (unregistered leftover, unpushed branch, dirty tree) is preserved.
+    // repoForWorktreePath returning null IS the unregistered-leftover case, so
+    // it lands on the same preserve branch it always did.
+    const repo = exports.repoForWorktreePath(wtPath)
+    if (!repo) { tally.preserved++; continue }
+    const registered = await registeredFor(repo)
     if (!registered.has(wtPath)) { tally.preserved++; continue }
-    const merged = await runGit(['merge-base', '--is-ancestor', 'worker/' + id, 'origin/main'])
+    const merged = await runGit(['merge-base', '--is-ancestor', 'worker/' + id, 'origin/main'], repo)
       .then(() => true).catch(() => false)
     if (!merged) { tally.preserved++; continue }
     let clean = false
@@ -4140,13 +4330,13 @@ exports.reapOrphanWorktrees = async function reapOrphanWorktrees(opts) {
     if (!clean) { tally.preserved++; continue }
 
     if (dryRun) { tally.reaped++; tally.reapedIds.push(id); continue }
-    await runGit(['worktree', 'remove', '--force', wtPath]).catch(() => {})
-    await runGit(['worktree', 'prune']).catch(() => {})
+    await runGit(['worktree', 'remove', '--force', wtPath], repo).catch(() => {})
+    await runGit(['worktree', 'prune'], repo).catch(() => {})
     if (fs.existsSync(wtPath)) {
       try { fs.rmSync(wtPath, { recursive: true, force: true }) } catch (_e) {}
-      await runGit(['worktree', 'prune']).catch(() => {})
+      await runGit(['worktree', 'prune'], repo).catch(() => {})
     }
-    await runGit(['branch', '-D', 'worker/' + id]).catch(() => {})
+    await runGit(['branch', '-D', 'worker/' + id], repo).catch(() => {})
     tally.reaped++; tally.reapedIds.push(id)
   }
   return tally
