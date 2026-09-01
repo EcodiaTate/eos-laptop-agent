@@ -46,7 +46,24 @@
 // works: corpus-snapshot-committer commits patterns/ locally within 6h,
 // precious-work-backup carries those commits off-disk, and the conductor pushes
 // on its own cadence. It is also how the 17 files rescued on 2026-08-23 landed.
-// Nothing new has to be built or scheduled for this to be durable.
+//
+// THAT LANE IS NOT UNIFORM ACROSS THE TABLE, and the sentence that used to sit
+// here ("nothing new has to be built or scheduled for this to be durable") was
+// true only of patterns/. Measured 2026-09-02 (lane H2 verify), per namespace:
+//   patterns/           indexed YES, off-disk YES, local commit YES
+//   drafts/postmortems/ indexed YES, off-disk YES, local commit NO
+// Indexed: knowledge-index/indexer.js ROOTS carries [BACKEND/drafts, "workbench"]
+// at entry 7, so a harvested postmortem IS reachable by knowledge.lookup, which
+// is the reader this whole module exists to serve. Off-disk: precious-work-backup
+// stages the whole tree, untracked files included, through a temp index before
+// write-tree, so it carries the file whether or not anything committed it.
+// Local commit: corpus-snapshot-committer's PATHSPEC is patterns/ .claude/skills/
+// docs/ plus named scripts, and it has NO drafts/ entry, so a harvested postmortem
+// stays permanently untracked in the conductor tree and never becomes a commit
+// object on the main lineage. It is not lost and it is not invisible; it just
+// never reaches origin/main or a cold clone on its own.
+// Widening that PATHSPEC is a separate change to a launchd job and is a merge
+// companion for whoever takes this branch, not a thing this module can do.
 //
 // WHY A PLAIN WRITE CANNOT DISTURB THE SHARED TREE
 // A plain fs write touches no ref, no index, and no HEAD, so the shared tree's
@@ -123,6 +140,25 @@ const EM_DASH = '\u2014'
 // and, on that window, harvests nothing new. Covering the real population means
 // a nested prefix, which is a much larger blast radius on a path that runs at
 // prune for EVERY dispatched worker, so it is Tate's call and not a self-grant.
+//
+// RE-DERIVED INDEPENDENTLY ON THE WHOLE POPULATION, 2026-09-02 lane H2 verify,
+// because a 150-branch cut is a convenience and the recommendation rests on it.
+// All 3,454 local worker/* branches: 226 carry any add at all. Restricted to the
+// 210 with a real dispatched-worker shape (<= 20 commits off main), 1,819 distinct
+// paths were ADDED off main: 167 top-level patterns/*.md, 1,652 stranded, and
+// still ZERO drafts/postmortems/*.md. The conclusion HOLDS on a window 1.4x wider
+// by branch and 26x larger by path.
+// The raw sweep does surface 4 drafts/postmortems/*.md, and every one is a false
+// instance: all 4 sit only on two long-lived branches carrying 665+ commits off
+// main back to a 2026-06-09 merge-base (divergent histories, not worker arcs),
+// and all 4 are already on disk, so harvest would skip them on the basename rail
+// regardless. Median adds per branch is 2; 17 branches exceed 500 and are this
+// same artefact.
+// The stranded 1,652 is dominated by scripts/claude-skills-backup/ (548),
+// scripts/ (295), scripts/app-tests/ (80), scripts/launchd/ (65), src/services/
+// (64), then nested drafts/<run-slug>/ scratch. None of it is .md doctrine under
+// a top-level prefix, which is the same answer the 150-cut gave, arrived at
+// independently.
 const HARVEST_PREFIXES = [
   { dir: 'patterns', re: /^patterns\/[^/]+\.md$/ },
   { dir: 'drafts/postmortems', re: /^drafts\/postmortems\/[^/]+\.md$/ },

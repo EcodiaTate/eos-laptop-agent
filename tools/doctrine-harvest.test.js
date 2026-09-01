@@ -76,8 +76,24 @@ function setup () {
 // Plant a worker branch the way the dispatcher does: a linked worktree off
 // origin/main, commits made inside it, worktree still present at harvest time.
 function plantWorkerBranch (shared, root, branch, files) {
+  return plantWorkerBranchFrom(shared, root, branch, 'origin/main', files)
+}
+
+// Same, but off an ARBITRARY base ref, and that is not a convenience.
+//
+// harvest reads adds with `diff-tree --diff-filter=A`, which compares a commit
+// to ITS PARENT, never to origin/main. So a fixture that bases the worker on the
+// CURRENT origin/main and then rewrites a path already published there produces
+// an M, not an A, and the candidate is dropped before any baseline is consulted.
+// Test 7 did exactly that from 2026-08-27 until 2026-09-02 and passed for the
+// wrong reason: proven by forcing basenamesOnMain to throw, which left the suite
+// at 72/72 green, and by a standalone probe that read back
+// `no harvestable file added on this branch` with an empty skipped[].
+// Basing the worker BEHIND the publish is what makes the add real, so the
+// origin/main baseline is the only thing left that can block it.
+function plantWorkerBranchFrom (shared, root, branch, baseRef, files) {
   const wt = path.join(root, 'wt-' + branch.replace(/\//g, '-'))
-  git(shared, ['worktree', 'add', '-B', branch, wt, 'origin/main'])
+  git(shared, ['worktree', 'add', '-B', branch, wt, baseRef])
   for (const [rel, body] of Object.entries(files)) {
     const full = path.join(wt, rel)
     fs.mkdirSync(path.dirname(full), { recursive: true })
@@ -398,8 +414,21 @@ async function main () {
   //    skipped rather than written, because writing it would create a second,
   //    divergent copy of the same doctrine that the next merge turns into a
   //    conflict. Surfacing that gap is doctrine-branch-drift-canary's job.
+  //
+  //    REPAIRED 2026-09-02 (lane H2 verify). This case was VACUOUS for five days.
+  //    It based the worker on the CURRENT origin/main, which already carried the
+  //    path, so the worker's commit was an M and diff-filter=A dropped it before
+  //    existingBasenames was ever asked. It asserted landed.length === 0 and got
+  //    it for free. Killing the whole origin/main leg (basenamesOnMain throws)
+  //    left the suite 72/72 GREEN, which is the discriminating proof that nothing
+  //    pinned this rail. The worker is now based BEHIND the publish so the add is
+  //    genuine, and the skip REASON is asserted so the test names which rail
+  //    blocked rather than accepting any zero.
   {
     const { root, origin, shared } = setup()
+
+    // The base the worker will be cut from, captured BEFORE origin/main moves.
+    const preBase = git(shared, ['rev-parse', 'origin/main']).trim()
 
     // Publish a pattern from a SEPARATE clone, so the shared tree's disk never
     // holds it while its origin/main does.
@@ -415,11 +444,24 @@ async function main () {
       filesOnMain(shared).includes('patterns/main-only-2026-08-27.md') &&
       !fs.existsSync(path.join(shared, 'patterns', 'main-only-2026-08-27.md')))
 
-    plantWorkerBranch(shared, root, 'worker/row-union', { 'patterns/main-only-2026-08-27.md': '# a DIVERGENT second copy\n' })
+    plantWorkerBranchFrom(shared, root, 'worker/row-union', preBase,
+      { 'patterns/main-only-2026-08-27.md': '# a DIVERGENT second copy\n' })
+
+    // The fixture's own load-bearing property. Without this the case can silently
+    // rot back into an M and start passing for the wrong reason again.
+    const unionSha = git(shared, ['rev-list', '-n', '1', 'worker/row-union']).trim()
+    ok('fixture: the worker commit genuinely ADDS the path (an M would never reach the baseline)',
+      git(shared, ['diff-tree', '--no-commit-id', '--name-only', '--diff-filter=A', '-r', unionSha, '--', 'patterns/'])
+        .split('\n').map((x) => x.trim()).filter(Boolean)
+        .includes('patterns/main-only-2026-08-27.md'))
+
     const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-union', rowId: 'row-union' })
     ok('a basename already on origin/main is not written to disk as a second copy',
       res.landed.length === 0 && !fs.existsSync(path.join(shared, 'patterns', 'main-only-2026-08-27.md')),
       JSON.stringify(res))
+    ok('and the origin/main BASELINE is what blocked it, named in the skip reason',
+      res.skipped.some((x) => x.path === 'patterns/main-only-2026-08-27.md' &&
+        /basename already in the corpus/.test(x.reason)), JSON.stringify(res))
     fs.rmSync(root, { recursive: true, force: true })
   }
 
@@ -648,6 +690,67 @@ async function main () {
       onDisk(shared, 'drafts/postmortems/mixed-batch-2099-05-05.md') &&
       res.landed.length === 2, JSON.stringify(res))
     ok('the build stamp records which harvest wrote them', typeof res.build === 'string' && res.build === BUILD)
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 20. THE ORIGIN/MAIN LEG OF THE WIDENING. The disk leg of the new namespace
+  //     was pinned by cases 14 through 19; this half was not, and the module's
+  //     own comment says why it matters: "This half is easy to forget and fixing
+  //     only the disk half leaves the bug alive."
+  //
+  //     Proven unpinned before this case existed: a mutant whose basenamesOnMain
+  //     reads ONLY patterns/ and returns empty sets for every other prefix left
+  //     the suite at 72/72 GREEN. A namespace whose main-leg baseline silently
+  //     does nothing writes a divergent second copy of doctrine already published
+  //     on origin/main, which is exactly the failure the union rail exists to
+  //     stop, and it would have shipped invisible.
+  {
+    const { root, origin, shared } = setup()
+    const preBase = git(shared, ['rev-parse', 'origin/main']).trim()
+
+    // Publish BOTH a live postmortem and an archived one from a separate clone,
+    // so origin/main carries them while the conductor's disk never has.
+    const other = path.join(root, 'other')
+    execFileSync('git', ['clone', origin, other], { stdio: 'ignore' })
+    fs.mkdirSync(path.join(other, 'drafts', 'postmortems', '_archived'), { recursive: true })
+    fs.writeFileSync(path.join(other, 'drafts', 'postmortems', 'pm-main-only-2099-06-06.md'), '# published elsewhere\n')
+    fs.writeFileSync(path.join(other, 'drafts', 'postmortems', '_archived', 'pm-main-arch-2099-06-06.md'), '# archived on main\n')
+    git(other, ['add', '-A'])
+    git(other, ['commit', '-q', '-m', 'postmortems that never reached the conductor tree'])
+    git(other, ['push', '-q', 'origin', 'main'])
+    git(shared, ['fetch', 'origin', '--quiet'])
+
+    ok('fixture: both postmortem basenames are on origin/main and neither is on disk',
+      filesOnMain(shared).includes('drafts/postmortems/pm-main-only-2099-06-06.md') &&
+      filesOnMain(shared).includes('drafts/postmortems/_archived/pm-main-arch-2099-06-06.md') &&
+      !onDisk(shared, 'drafts/postmortems/pm-main-only-2099-06-06.md') &&
+      !onDisk(shared, 'drafts/postmortems/pm-main-arch-2099-06-06.md'))
+
+    plantWorkerBranchFrom(shared, root, 'worker/row-pm-main', preBase, {
+      'drafts/postmortems/pm-main-only-2099-06-06.md': '# a DIVERGENT second copy\n',
+      'drafts/postmortems/pm-main-arch-2099-06-06.md': '# un-archived from the main copy\n',
+    })
+
+    const pmSha = git(shared, ['rev-list', '-n', '1', 'worker/row-pm-main']).trim()
+    ok('fixture: both worker paths are genuine ADDs, so the baseline is the only thing that can block',
+      git(shared, ['diff-tree', '--no-commit-id', '--name-only', '--diff-filter=A', '-r', pmSha, '--', 'drafts/postmortems/'])
+        .split('\n').map((x) => x.trim()).filter(Boolean).length === 2)
+
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm-main', rowId: 'row-pm-main' })
+
+    ok('a postmortem basename LIVE on origin/main blocks, exactly as a pattern basename does',
+      !res.landed.includes('drafts/postmortems/pm-main-only-2099-06-06.md') &&
+      !onDisk(shared, 'drafts/postmortems/pm-main-only-2099-06-06.md') &&
+      res.skipped.some((x) => x.path === 'drafts/postmortems/pm-main-only-2099-06-06.md' &&
+        /basename already in the corpus/.test(x.reason)), JSON.stringify(res))
+
+    ok('a postmortem basename ARCHIVED on origin/main does NOT block the un-archival',
+      res.landed.includes('drafts/postmortems/pm-main-arch-2099-06-06.md') &&
+      onDisk(shared, 'drafts/postmortems/pm-main-arch-2099-06-06.md'), JSON.stringify(res))
+
+    ok('and that un-archival is announced, so a wrong judgement is reversible',
+      (res.unarchived || []).includes('pm-main-arch-2099-06-06.md'), JSON.stringify(res.unarchived))
+
     fs.rmSync(root, { recursive: true, force: true })
   }
 
