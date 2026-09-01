@@ -181,7 +181,7 @@ async function main () {
     ok('(a) existing pattern is untouched on disk', readDisk(shared, 'patterns/existing-rule-2026-01-01.md').trim() === '# an existing rule')
     ok('(a) nothing was landed', res.landed.length === 0, JSON.stringify(res))
     ok('(a) a rewrite is dropped by diff-filter=A, so it never reaches the basename rail',
-      res.skipped.length === 0 && /no patterns\/\*\.md added/.test(res.reason), JSON.stringify(res))
+      res.skipped.length === 0 && /no harvestable file added/.test(res.reason), JSON.stringify(res))
     ok('(a) the working tree is clean', git(shared, ['status', '--porcelain']).trim() === '')
 
     // (b) The disk-baseline case. Written to disk, deliberately NOT committed, so
@@ -519,6 +519,135 @@ async function main () {
     ok('the decoy branch was not harvested',
       !onDisk(shared, 'patterns/decoy-2026-08-30.md') &&
       readDisk(shared, 'patterns/exact-wins-2026-08-30.md') === '# exact\n', JSON.stringify(res))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // ==========================================================================
+  // PREFIX WIDENING (2026-09-02, board 8b7b19e4). The harvest used to hardcode
+  // 'patterns/' in three places, so every non-pattern deliverable a worker
+  // committed died with its branch. These cases pin the widened shape, and the
+  // one that actually matters is the cross-namespace basename: a global
+  // basename set would refuse a postmortem for colliding with a PATTERN it can
+  // never shadow, and that refusal is invisible and permanent because nothing
+  // ever retries a harvest.
+  // ==========================================================================
+
+  // 14. A postmortem lands in its OWN directory, not flattened into patterns/.
+  {
+    const { root, shared } = setup()
+    plantWorkerBranch(shared, root, 'worker/row-pm1', {
+      'drafts/postmortems/chat-postmortem-2099-01-01.md': '# a postmortem the worker could not push\n',
+    })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm1', rowId: 'row-pm1' })
+    ok('a postmortem is harvested at all',
+      res.ok === true && res.landed.includes('drafts/postmortems/chat-postmortem-2099-01-01.md'), JSON.stringify(res))
+    ok('it lands under drafts/postmortems/, NOT flattened into patterns/',
+      onDisk(shared, 'drafts/postmortems/chat-postmortem-2099-01-01.md') &&
+      !onDisk(shared, 'patterns/chat-postmortem-2099-01-01.md'), JSON.stringify(patternsOnDisk(shared)))
+    ok('the landed postmortem body is byte-identical to what the worker wrote',
+      readDisk(shared, 'drafts/postmortems/chat-postmortem-2099-01-01.md') === '# a postmortem the worker could not push\n')
+    ok('NEGATIVE CONTROL: the postmortem was NOT published to origin/main',
+      !filesOnMain(shared).includes('drafts/postmortems/chat-postmortem-2099-01-01.md'))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 15. THE CASE A GLOBAL BASELINE GETS WRONG. Same basename, two namespaces.
+  //     The pattern already exists on disk; the postmortem of the same name has
+  //     never been seen. They land in different directories and neither can
+  //     shadow the other, so the postmortem must NOT be refused.
+  {
+    const { root, shared } = setup()
+    plantWorkerBranch(shared, root, 'worker/row-pm2', {
+      'drafts/postmortems/existing-rule-2026-01-01.md': '# a postmortem that happens to share a pattern basename\n',
+    })
+    ok('fixture: the basename is already LIVE in patterns/',
+      onDisk(shared, 'patterns/existing-rule-2026-01-01.md'))
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm2', rowId: 'row-pm2' })
+    ok('a basename live in ANOTHER namespace does not block this one',
+      res.landed.includes('drafts/postmortems/existing-rule-2026-01-01.md'), JSON.stringify(res))
+    ok('the same-named pattern was left untouched',
+      readDisk(shared, 'patterns/existing-rule-2026-01-01.md').trim() === '# an existing rule')
+    ok('the cross-namespace landing is not mislabelled an un-archival',
+      !(res.unarchived || []).includes('existing-rule-2026-01-01.md'), JSON.stringify(res.unarchived))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 16. Add-only still holds WITHIN the new namespace. A postmortem basename
+  //     already on disk blocks, exactly as a pattern basename does.
+  {
+    const { root, shared } = setup()
+    fs.mkdirSync(path.join(shared, 'drafts', 'postmortems'), { recursive: true })
+    fs.writeFileSync(path.join(shared, 'drafts', 'postmortems', 'chat-postmortem-2099-02-02.md'),
+      '# the conductor wrote this one\n')
+    plantWorkerBranch(shared, root, 'worker/row-pm3', {
+      'drafts/postmortems/chat-postmortem-2099-02-02.md': '# HOSTILE REWRITE from a worker branch\n',
+    })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm3', rowId: 'row-pm3' })
+    ok('a live postmortem basename blocks the add',
+      res.landed.length === 0 &&
+      res.skipped.some((x) => x.path === 'drafts/postmortems/chat-postmortem-2099-02-02.md'), JSON.stringify(res))
+    ok('the existing postmortem was NOT overwritten',
+      readDisk(shared, 'drafts/postmortems/chat-postmortem-2099-02-02.md') === '# the conductor wrote this one\n')
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 17. TOP LEVEL OF THE PREFIX ONLY, and the SCOPE LIMIT this ships with.
+  //     Measured 2026-09-02 across the 150 most recent worker/* branches: 50
+  //     added paths were stranded and NONE of them was drafts/postmortems/*.md.
+  //     The real stranding population is nested per-run scratch, and this case
+  //     pins that it is still NOT harvested, so the review row's claim is
+  //     proven by a test rather than asserted in prose.
+  {
+    const { root, shared } = setup()
+    plantWorkerBranch(shared, root, 'worker/row-pm4', {
+      'drafts/postmortems/nested/deep-2099-03-03.md': '# nested under the prefix\n',
+      'drafts/ceiling-wrapper-census-2099-03-03/report.md': '# the shape that actually strands today\n',
+      'scripts/some-worker-helper.js': 'module.exports = {}\n',
+      'drafts/postmortems/chat-postmortem-2099-03-03.md': '# the one in scope\n',
+    })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm4', rowId: 'row-pm4' })
+    ok('the in-scope postmortem landed', res.landed.includes('drafts/postmortems/chat-postmortem-2099-03-03.md'), JSON.stringify(res))
+    ok('a file NESTED under the prefix is not harvested',
+      !onDisk(shared, 'drafts/postmortems/nested/deep-2099-03-03.md') &&
+      res.landed.length === 1, JSON.stringify(res.landed))
+    ok('SCOPE LIMIT: per-run scratch (the measured stranding population) is still not harvested',
+      !onDisk(shared, 'drafts/ceiling-wrapper-census-2099-03-03/report.md'))
+    ok('SCOPE LIMIT: a non-md worker deliverable is still not harvested',
+      !onDisk(shared, 'scripts/some-worker-helper.js'))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 18. The em-dash rail is a property of the harvest, not of patterns/, so it
+  //     must hold on every namespace the table grows.
+  {
+    const { root, shared } = setup()
+    plantWorkerBranch(shared, root, 'worker/row-pm5', {
+      'drafts/postmortems/dirty-2099-04-04.md': '# a postmortem carrying a banned ' + '\u2014' + ' dash\n',
+      'drafts/postmortems/clean-2099-04-04.md': '# a clean sibling\n',
+    })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm5', rowId: 'row-pm5' })
+    ok('an em-dash postmortem is refused',
+      !onDisk(shared, 'drafts/postmortems/dirty-2099-04-04.md') &&
+      res.refused.some((r) => /em-dash/.test(r.reason)), JSON.stringify(res))
+    ok('its clean sibling still lands',
+      onDisk(shared, 'drafts/postmortems/clean-2099-04-04.md'), JSON.stringify(res.landed))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+
+  // 19. Mixed batch across both namespaces in one commit, which is the shape a
+  //     real worker leaves behind (it writes doctrine AND a report).
+  {
+    const { root, shared } = setup()
+    plantWorkerBranch(shared, root, 'worker/row-pm6', {
+      'patterns/mixed-batch-rule-2099-05-05.md': '# doctrine\n',
+      'drafts/postmortems/mixed-batch-2099-05-05.md': '# the report\n',
+    })
+    const res = await harvestDoctrine({ sharedTree: shared, branch: 'worker/row-pm6', rowId: 'row-pm6' })
+    ok('both namespaces land from one commit',
+      onDisk(shared, 'patterns/mixed-batch-rule-2099-05-05.md') &&
+      onDisk(shared, 'drafts/postmortems/mixed-batch-2099-05-05.md') &&
+      res.landed.length === 2, JSON.stringify(res))
+    ok('the build stamp records which harvest wrote them', typeof res.build === 'string' && res.build === BUILD)
     fs.rmSync(root, { recursive: true, force: true })
   }
 

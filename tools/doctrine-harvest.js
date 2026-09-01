@@ -92,9 +92,49 @@ const MAX_FILES = 25
 // only when something lands. A prune that lands nothing is the common case, so
 // that proof was unavailable most of the time. Bump this string with any change
 // whose liveness a later session has to establish from the log alone.
-const BUILD = 'branch-resolve-2026-08-30'
+const BUILD = 'prefix-widen-2026-09-02'
 // Escaped, never a literal: this file is itself subject to the character-level ban.
 const EM_DASH = '\u2014'
+
+// THE HARVESTED PREFIXES, AND WHY THIS IS A TABLE (2026-09-02)
+//
+// Until now the pathspec was the literal 'patterns/' in three separate places:
+// the diff-tree call, the disk baseline walk, and the ls-tree baseline. A worker
+// deliverable that was not a top-level pattern file died with its branch, and the
+// discriminator that proves the allowlist is the cause rather than worker
+// behaviour is that patterns from the SAME fires survived. Board 8b7b19e4.
+//
+// Each entry is a namespace: its own collision baseline, its own destination
+// directory, TOP LEVEL OF THE PREFIX ONLY. Adding a fourth namespace is one line
+// here and nothing else, which is the point of the shape.
+//
+// THE BASELINE IS PER-PREFIX AND THAT IS LOAD-BEARING. A postmortem sharing a
+// basename with a pattern is not a collision: they land in different directories
+// and neither shadows the other. A single global basename set would refuse the
+// postmortem for a name clash that cannot exist on disk, which is the invisible
+// permanent failure this module already learned to avoid with archived names.
+//
+// MEASURED BEFORE SHIPPING, and the number argues for review rather than comfort:
+// across the 150 most recently-committed worker/* branches (2026-09-02), 68
+// distinct paths were ADDED off main. 18 were top-level patterns/*.md (harvested
+// today) and 50 were stranded. ZERO of the 50 were drafts/postmortems/*.md. The
+// live stranding population is nested per-run scratch (drafts/<run-slug>/**, 17
+// in one census directory alone) plus scripts/. So this table closes the SHAPE
+// and, on that window, harvests nothing new. Covering the real population means
+// a nested prefix, which is a much larger blast radius on a path that runs at
+// prune for EVERY dispatched worker, so it is Tate's call and not a self-grant.
+const HARVEST_PREFIXES = [
+  { dir: 'patterns', re: /^patterns\/[^/]+\.md$/ },
+  { dir: 'drafts/postmortems', re: /^drafts\/postmortems\/[^/]+\.md$/ },
+]
+
+// The prefix a candidate path belongs to, or null when it is not harvestable.
+// One function so the diff-tree filter and the per-file destination can never
+// disagree about what is in scope.
+function prefixFor (p) {
+  for (const pref of HARVEST_PREFIXES) if (pref.re.test(p)) return pref
+  return null
+}
 
 function auditPath () {
   return process.env.DOCTRINE_HARVEST_LOG ||
@@ -203,14 +243,16 @@ async function commitsOffMain (git, branch) {
   return out.split('\n').map((s) => s.trim()).filter(Boolean)
 }
 
-// Top-level patterns/*.md paths ADDED by a commit. diff-filter=A is what makes
-// this add-only at the commit level; the basename check below makes it add-only
-// against main.
+// Paths ADDED by a commit that fall inside a harvested prefix. diff-filter=A is
+// what makes this add-only at the commit level; the basename check below makes it
+// add-only against main. The pathspec and the regex filter come from the SAME
+// table, so a prefix can never be diffed-for and then silently dropped.
 async function addedPatternPaths (git, sha) {
-  const out = await git(['diff-tree', '--no-commit-id', '--name-only', '--diff-filter=A', '-r', sha, '--', 'patterns/'])
+  const pathspec = HARVEST_PREFIXES.map((pref) => pref.dir + '/')
+  const out = await git(['diff-tree', '--no-commit-id', '--name-only', '--diff-filter=A', '-r', sha, '--'].concat(pathspec))
   return out.split('\n')
     .map((s) => s.trim())
-    .filter((p) => /^patterns\/[^/]+\.md$/.test(p))
+    .filter((p) => !!prefixFor(p))
 }
 
 // Every pattern basename the corpus ALREADY holds, from both surfaces, because
@@ -247,55 +289,83 @@ async function addedPatternPaths (git, sha) {
 // nothing ever retries a harvest: the branch is pruned seconds later. So an
 // archived basename no longer blocks, and every such landing is announced in
 // result.unarchived so the conductor can reverse it if the judgement was wrong.
+// Returns Map<prefixDir, {live, archived}>. Per-prefix because the baseline a
+// candidate is checked against must be the namespace it will actually be written
+// into, never the union of all of them.
 function basenamesOnDisk (sharedTree) {
-  const live = new Set()
-  const archived = new Set()
-  const root = path.join(sharedTree, 'patterns')
-  const walk = (dir, depth) => {
-    let entries = []
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_e) { return }
-    for (const e of entries) {
-      if (e.name === 'node_modules' || e.name === '.git') continue
-      const full = path.join(dir, e.name)
-      if (e.isDirectory()) walk(full, depth + 1)
-      else if (e.isFile() && e.name.endsWith('.md')) (depth === 0 ? live : archived).add(e.name)
+  const byPrefix = new Map()
+  for (const pref of HARVEST_PREFIXES) {
+    const live = new Set()
+    const archived = new Set()
+    const root = path.join(sharedTree, pref.dir)
+    const walk = (dir, depth) => {
+      let entries = []
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_e) { return }
+      for (const e of entries) {
+        if (e.name === 'node_modules' || e.name === '.git') continue
+        const full = path.join(dir, e.name)
+        if (e.isDirectory()) walk(full, depth + 1)
+        else if (e.isFile() && e.name.endsWith('.md')) (depth === 0 ? live : archived).add(e.name)
+      }
     }
+    walk(root, 0)
+    byPrefix.set(pref.dir, { live, archived })
   }
-  walk(root, 0)
-  return { live, archived }
+  return byPrefix
 }
 
 // Same split on the origin/main leg. This half is easy to forget and fixing only
 // the disk half leaves the bug alive: `ls-tree -r` walks every depth, so a copy
 // archived ON ORIGIN/MAIN poisoned the baseline exactly like the disk copy did.
 async function basenamesOnMain (git) {
-  const out = await git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'patterns/'])
-  const live = new Set()
-  const archived = new Set()
-  for (const line of out.split('\n')) {
-    const p = line.trim()
-    if (!p.endsWith('.md')) continue
-    const rest = p.startsWith('patterns/') ? p.slice('patterns/'.length) : p
-    ;(rest.includes('/') ? archived : live).add(path.posix.basename(p))
+  const byPrefix = new Map()
+  for (const pref of HARVEST_PREFIXES) {
+    const out = await git(['ls-tree', '-r', '--name-only', 'origin/main', '--', pref.dir + '/'])
+    const live = new Set()
+    const archived = new Set()
+    const head = pref.dir + '/'
+    for (const line of out.split('\n')) {
+      const p = line.trim()
+      if (!p.endsWith('.md')) continue
+      const rest = p.startsWith(head) ? p.slice(head.length) : p
+      ;(rest.includes('/') ? archived : live).add(path.posix.basename(p))
+    }
+    byPrefix.set(pref.dir, { live, archived })
   }
-  return { live, archived }
+  return byPrefix
 }
 
 // The union, kept split. A failure to read origin/main is NOT fatal (the disk rail
 // plus the 'wx' exclusive create still hold add-only), but it must not silently
 // widen what harvest is willing to write, so it degrades to disk-only and says so.
 async function existingBasenames (git, sharedTree) {
-  const { live, archived } = basenamesOnDisk(sharedTree)
+  const disk = basenamesOnDisk(sharedTree)
+  let main = null
   let degraded = false
   try {
-    const m = await basenamesOnMain(git)
-    for (const bn of m.live) live.add(bn)
-    for (const bn of m.archived) archived.add(bn)
+    main = await basenamesOnMain(git)
   } catch (_e) { degraded = true }
-  // A basename that is live SOMEWHERE outranks the same basename archived
-  // elsewhere: live blocks, and being archived on the other leg cannot unblock it.
-  for (const bn of live) archived.delete(bn)
-  return { set: live, archived, degraded }
+
+  const byPrefix = new Map()
+  for (const pref of HARVEST_PREFIXES) {
+    const d = disk.get(pref.dir)
+    const live = new Set(d.live)
+    const archived = new Set(d.archived)
+    if (main) {
+      const m = main.get(pref.dir)
+      if (m) {
+        for (const bn of m.live) live.add(bn)
+        for (const bn of m.archived) archived.add(bn)
+      }
+    }
+    // A basename that is live SOMEWHERE outranks the same basename archived
+    // elsewhere: live blocks, and being archived on the other leg cannot unblock it.
+    // Scoped WITHIN the prefix, because that is the only place the two copies can
+    // shadow each other.
+    for (const bn of live) archived.delete(bn)
+    byPrefix.set(pref.dir, { set: live, archived })
+  }
+  return { byPrefix, degraded }
 }
 
 // ── the harvest ──────────────────────────────────────────────────────────────
@@ -390,7 +460,7 @@ async function _harvest (opts) {
   }
   if (!candidates.size) {
     result.ok = true
-    result.reason = 'no patterns/*.md added on this branch'
+    result.reason = 'no harvestable file added on this branch (' + HARVEST_PREFIXES.map((p) => p.dir + '/*.md').join(', ') + ')'
     return result
   }
 
@@ -400,10 +470,16 @@ async function _harvest (opts) {
   // Resolve each candidate to a blob, applying the add-only and em-dash rails.
   const toLand = []
   for (const [p, sha] of candidates) {
+    const pref = prefixFor(p)
+    if (!pref) { result.refused.push({ path: p, reason: 'not inside a harvested prefix' }); continue }
+    const base = existing.byPrefix.get(pref.dir)
     const bn = path.posix.basename(p)
-    if (existing.set.has(bn)) { result.skipped.push({ path: p, reason: 'basename already in the corpus' }); continue }
+    // Scoped to this path's OWN namespace. The same basename living under a
+    // different harvested prefix is a different document in a different
+    // directory and must not block this one.
+    if (base.set.has(bn)) { result.skipped.push({ path: p, reason: 'basename already in the corpus' }); continue }
     // Not a block. Recorded so the landing is reviewable rather than silent.
-    if (existing.archived.has(bn)) result.unarchived.push(bn)
+    if (base.archived.has(bn)) result.unarchived.push(bn)
     if (toLand.length >= MAX_FILES) { result.skipped.push({ path: p, reason: 'MAX_FILES cap reached' }); continue }
     let blob
     try {
@@ -426,7 +502,7 @@ async function _harvest (opts) {
     // body is carried, not re-read at write time: it is the exact bytes already
     // vetted against the em-dash ban and the empty-file rail. Re-reading the blob
     // later would let a vetted file and a written file drift apart.
-    toLand.push({ path: p, blob, sha, basename: bn, body })
+    toLand.push({ path: p, blob, sha, basename: bn, body, dir: pref.dir })
   }
 
   if (!toLand.length) {
@@ -456,17 +532,28 @@ async function _harvest (opts) {
   // already written are real doctrine that is already readable, so removing
   // them to make the result tidy would destroy the exact thing this exists to
   // save. landed[] carries what is on disk; refused[] carries the rest.
-  const patternsDir = path.join(sharedTree, 'patterns')
-  try {
-    fs.mkdirSync(patternsDir, { recursive: true })
-  } catch (e) {
-    result.reason = 'patterns dir unusable: ' + (e && e.message || e)
-    result.refused = result.refused.concat(toLand.map((f) => ({ path: f.path, reason: 'patterns dir unusable' })))
-    return result
-  }
-
+  // One mkdir per destination namespace, created lazily so a prefix that no file
+  // targets is never materialised in the conductor tree. An unusable destination
+  // refuses only the files bound for THAT directory: a sibling prefix landing
+  // correctly is real doctrine and must not be thrown away to make the failure
+  // tidy, which is the same reason a mid-batch write failure is not rolled back.
+  const madeDirs = new Map()
   for (const f of toLand) {
-    const dest = path.join(patternsDir, f.basename)
+    const destDir = path.join(sharedTree, f.dir)
+    if (!madeDirs.has(destDir)) {
+      try {
+        fs.mkdirSync(destDir, { recursive: true })
+        madeDirs.set(destDir, null)
+      } catch (e) {
+        madeDirs.set(destDir, (e && e.message) || String(e))
+      }
+    }
+    const dirErr = madeDirs.get(destDir)
+    if (dirErr) {
+      result.refused.push({ path: f.path, reason: f.dir + ' dir unusable: ' + dirErr })
+      continue
+    }
+    const dest = path.join(destDir, f.basename)
     try {
       fs.writeFileSync(dest, f.body, { encoding: 'utf8', flag: 'wx' })
       result.landed.push(f.path)
