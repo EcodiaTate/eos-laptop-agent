@@ -865,7 +865,15 @@ async function dispatch_worker(params) {
     const verifyFlag = {
       task_id, tab_id,
       brief_size_bytes,
-      brief_sha256: crypto.createHash('sha256').update(brief_body).digest('hex'),
+      // 2026-09-07 GATE2-mac: hash the SAME string the audit file holds
+      // (briefed_body, sentinel-prefixed), not the bare brief_body. The
+      // size field beside it has always measured briefed_body, so the pair
+      // described two different strings and coord.verify_paste (which hashes
+      // the file) could never agree with it. Measured before the fix: 0 of
+      // 4,735 flags on disk verified, so the one documented use of this field
+      // - a worker checking its paste was not truncated - returned a false
+      // corruption signal every single time it was ever exercised.
+      brief_sha256: crypto.createHash('sha256').update(briefed_body).digest('hex'),
       pasted_at: new Date().toISOString(),
     }
     fs.writeFileSync(path.join(BRIEFS_DIR, task_id + '-PASTE-VERIFY.flag'),
