@@ -138,6 +138,22 @@ for s in tools/account-cap-decide.js tools/real-limit-watch.js tools/usage-real.
   else fails=$((fails+1)); echo "  FAIL  $s --selftest"; printf '%s\n' "$out" | tail -8 | sed 's/^/        /'; fi
 done
 
+# MUTATION GATE (2026-09-07 lane D1). The suite above proves the lease pager fires.
+# This proves its CONTROLS are load-bearing: each gate is deleted in a copy of the real
+# source and the matching control must flip RED. A control that survives its own
+# mutation is agreeing, not working, which is the default failure shape per
+# [[a-first-draft-control-usually-passes-for-the-wrong-reason-2026-09-06]]. Enrolled
+# here because an artifact nothing runs is this repo's recurring defect.
+if [ -f "$ROOT/tools/scheduler-lease-pager.test.js" ]; then
+  echo "=== mutation gate ==="
+  if out="$(node "$ROOT/tools/scheduler-lease-pager.test.js" --mutate 2>&1 | redact)"; then
+    passes=$((passes+1)); echo "  PASS  scheduler-lease-pager --mutate"
+  else
+    fails=$((fails+1)); echo "  FAIL  scheduler-lease-pager --mutate"
+    printf '%s\n' "$out" | tail -10 | sed 's/^/        /'
+  fi
+fi
+
 echo "=== suites ==="
 # lib/ was NOT in this glob until 2026-08-29, so a test living beside the module
 # it guards was invisible to the commit gate. That is the enrolment half of the

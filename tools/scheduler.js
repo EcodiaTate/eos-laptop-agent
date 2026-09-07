@@ -913,6 +913,235 @@ exports.handleAllAccountsCappedDefer = async function handleAllAccountsCappedDef
   }
 }
 
+// -- lease-path exception pager (2026-09-07 lane D1) ---------------------------
+//
+// THE FAILURE THIS CLOSES. On 2026-09-06 the dispatch loop's leaseDueRows call
+// threw `getaddrinfo ENOTFOUND aws-1-ap-southeast-2.pooler.supabase.com` on every
+// 30s pass from 14:00Z to 21:55Z. Zero rows were leased for 7h55m: no cron fired,
+// no worker opened, the whole fleet was dead. It produced 24,273 stderr lines and
+// ZERO alerts, and nobody found it for eight hours.
+//
+// Every mechanism built to notice a dispatch stoppage missed it, each for its own
+// reason, which is why the fix belongs HERE and not at the next trigger:
+//   - noteTransientDefer pages on the IDE-bridge branch. Never reached: the throw
+//     happens in the lease, two hundred lines before any dispatch branch runs.
+//   - noteAllAccountsCapped pages on the cap branch. Same reason.
+//   - breakerRecordDispatch counts only AFTER a confirmed tab spawn, so a fleet
+//     that spawns nothing counts nothing and the breaker reads idle, not broken.
+//   - scheduler-health.sh counts retry_count on cap markers. The lease throw never
+//     reaches a row, so no row is marked and the detector reads green.
+//   - the watchdog at checkDispatchWedge keys on _dispatchPassRunning. The pass was
+//     not wedged. It ran, threw, and returned cleanly every 30s, which is the one
+//     shape a hang detector cannot see.
+// Same shape as [[a-cap-defer-that-increments-nothing-is-invisible-to-the-detector-built-for-it-2026-08-29]],
+// reached by a different trigger. So this counts EVERY lease exception, not DNS.
+//
+// WHY THE PAGE IS THE PRIMARY ALERT AND THE BOARD ROW IS NOT. status_board lives
+// behind the SAME Supabase pooler whose name resolution is the most likely cause of
+// a lease throw. An alert that writes to the board first is an alert that is silent
+// in exactly the case it was built for. text-tate.js is pure osascript into
+// Messages.app: no network, no DB, no Claude budget, so it fires while the pooler is
+// unreachable. The board row is attempted anyway (a lease throw has other causes),
+// and when that write fails the outage is held in a LOCAL breadcrumb file and
+// flushed to the board by noteLeaseOk the moment leasing recovers. The board
+// therefore always gets the row; on a DB-caused outage it gets it on recovery.
+
+const LEASE_ERROR_PAGE_THRESHOLD =
+  parseInt(process.env.SCHEDULER_LEASE_ERROR_PAGE_THRESHOLD, 10) || 10
+const LEASE_BREADCRUMB_FILE = process.env.SCHEDULER_LEASE_BREADCRUMB_FILE ||
+  '/Users/ecodia/.ecodiaos/coordination/lease-outage.json'
+
+exports.LEASE_ERROR_PAGE_THRESHOLD = LEASE_ERROR_PAGE_THRESHOLD
+exports.LEASE_BREADCRUMB_FILE = LEASE_BREADCRUMB_FILE
+
+// Test seam, same shape as _setPagerSender. A suite that exercises the pager must
+// not reach Postgres: the board write is a separate leg on purpose and its failure
+// is a tested path, so a real connection attempt would make the suite depend on the
+// very substrate whose absence this pager exists to survive.
+let _leaseBoardWriter = null
+exports._setLeaseBoardWriter = function (fn) { _leaseBoardWriter = fn }
+
+let _consecutiveLeaseErrors = 0
+let _leaseErrorFirstAt = null
+let _leaseErrorLastMsg = ''
+let _leaseErrorPageSent = false
+let _lastLeaseOkAt = 0
+
+exports._getLeaseErrorState = function () {
+  return {
+    consecutive: _consecutiveLeaseErrors,
+    firstAt: _leaseErrorFirstAt,
+    lastMsg: _leaseErrorLastMsg,
+    paged: _leaseErrorPageSent,
+    lastOkAt: _lastLeaseOkAt,
+  }
+}
+exports._resetLeaseErrorState = function (o) {
+  o = o || {}
+  _consecutiveLeaseErrors = o.consecutive || 0
+  _leaseErrorFirstAt = o.firstAt === undefined ? null : o.firstAt
+  _leaseErrorLastMsg = o.lastMsg || ''
+  _leaseErrorPageSent = !!o.paged
+  _lastLeaseOkAt = o.lastOkAt || 0
+}
+
+// An exception's message is NOT reliably present. The live 2026-09-06 log carries
+// `[scheduler] leaseDueRows error: ` with an EMPTY message, so a detector that keys
+// on message content reads a real outage as no error at all. Normalise once, here.
+function _leaseErrDetail(errMsg) {
+  if (errMsg == null) return '(exception carried an empty message)'
+  // `errMsg.message || errMsg` is the tempting form and it is WRONG for exactly the
+  // shape this exists for: an Error whose message is '' is falsy, so it falls back to
+  // String(err) = 'Error' and the empty message is laundered into a plausible-looking
+  // word. Read .message when the property EXISTS, however empty it is.
+  const raw = (typeof errMsg === 'object' && 'message' in errMsg) ? errMsg.message : errMsg
+  const s = String(raw == null ? '' : raw).trim()
+  return s || '(exception carried an empty message)'
+}
+
+// Durable, LOCAL, and unable to throw. This is the leg that survives the DB being
+// the cause. Guarded at every step: a breadcrumb failure must never take down the
+// dispatch loop it is reporting on.
+function _writeLeaseBreadcrumb(payload) {
+  try {
+    const fs = require('fs')
+    const path = require('path')
+    try { fs.mkdirSync(path.dirname(LEASE_BREADCRUMB_FILE), { recursive: true }) } catch (_e) {}
+    const tmp = LEASE_BREADCRUMB_FILE + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2))
+    fs.renameSync(tmp, LEASE_BREADCRUMB_FILE)   // atomic: no torn read by a hook
+    return true
+  } catch (_e) { return false }
+}
+function _readLeaseBreadcrumb() {
+  try { return JSON.parse(require('fs').readFileSync(LEASE_BREADCRUMB_FILE, 'utf8')) }
+  catch (_e) { return null }
+}
+function _clearLeaseBreadcrumb() {
+  try { require('fs').unlinkSync(LEASE_BREADCRUMB_FILE) } catch (_e) {}
+}
+exports._readLeaseBreadcrumb = _readLeaseBreadcrumb
+exports._clearLeaseBreadcrumb = _clearLeaseBreadcrumb
+
+// Best-effort board write. Never throws, never awaited on the dispatch path.
+// Returns true only when a row actually landed, so the breadcrumb is cleared on
+// proof rather than on intent.
+exports.writeLeaseOutageBoardRow = async function writeLeaseOutageBoardRow(crumb) {
+  if (!crumb) return false
+  if (_leaseBoardWriter) return await _leaseBoardWriter(crumb)
+  try {
+    const started = crumb.first_error_at ? new Date(crumb.first_error_at).toISOString() : 'unknown'
+    const ctx = 'Scheduler lease path threw on ' + crumb.consecutive +
+      ' consecutive passes starting ' + started +
+      '. No rows leased for that whole period, so every cron and every worker was stopped. ' +
+      'Last exception: ' + String(crumb.last_error || '').slice(0, 300) +
+      (crumb.recovered_at ? '. Leasing recovered ' + crumb.recovered_at + '.' : '. STILL STALLED at write time.')
+    await getPool().query(
+      `INSERT INTO status_board (entity_type, entity_ref, name, status, next_action, next_action_by, context, priority, last_touched)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())`,
+      ['incident', 'ecodiaos-scheduler',
+        'Scheduler lease path threw: fleet dispatch stalled',
+        crumb.recovered_at ? 'active' : 'blocked',
+        'Re-derive the cause of the lease exception and confirm dispatch is flowing (brief-file histogram per UTC hour, not last_run_at)',
+        'ecodiaos', ctx, 1]
+    )
+    return true
+  } catch (e) {
+    process.stderr.write('[scheduler] lease outage board write failed (held in breadcrumb): ' +
+      ((e && e.message) || e) + '\n')
+    return false
+  }
+}
+
+// Called from the dispatch loop's leaseDueRows catch. Counts consecutive throws
+// and, at the threshold, fires exactly one page for this outage. PURE apart from
+// the pager seam and the local breadcrumb, so a test drives it with no DB and no
+// send. Returns the constructed page (or null) so tests assert on it.
+exports.noteLeaseError = function noteLeaseError(errMsg, nowMs) {
+  const now = nowMs || Date.now()
+  _consecutiveLeaseErrors += 1
+  if (_leaseErrorFirstAt === null) _leaseErrorFirstAt = now
+  _leaseErrorLastMsg = _leaseErrDetail(errMsg)
+
+  const crumb = {
+    kind: 'scheduler_lease_outage',
+    consecutive: _consecutiveLeaseErrors,
+    first_error_at: new Date(_leaseErrorFirstAt).toISOString(),
+    last_error_at: new Date(now).toISOString(),
+    last_error: _leaseErrorLastMsg,
+    threshold: LEASE_ERROR_PAGE_THRESHOLD,
+    paged: _leaseErrorPageSent,
+    pid: process.pid,
+  }
+  _writeLeaseBreadcrumb(crumb)
+
+  if (_consecutiveLeaseErrors < LEASE_ERROR_PAGE_THRESHOLD || _leaseErrorPageSent) return null
+
+  // Optimistic latch, unlatched by a non-zero send, exactly as noteTransientDefer.
+  _leaseErrorPageSent = true
+  crumb.paged = true
+  _writeLeaseBreadcrumb(crumb)
+
+  const stalledMin = Math.round((now - _leaseErrorFirstAt) / 60000)
+  const msg = 'FLEET STALLED: the scheduler lease path has thrown on ' +
+    _consecutiveLeaseErrors + ' consecutive passes (~' + stalledMin + 'min). ' +
+    'No rows are being leased, so every cron and every worker is stopped. ' +
+    'The agent process is ALIVE, so no crash or wedge alert will fire. ' +
+    'Cause: ' + _leaseErrorLastMsg.slice(0, 140)
+  // --urgency critical is load-bearing: see noteTransientDefer. The fyi tier lints
+  // for operator vocabulary and refused the DISPATCH OUTAGE page 62 times over four
+  // days on the word "DISPATCH" alone.
+  const args = ['--from', 'scheduler lease watchdog', '--urgency', 'critical', msg]
+  _pagerSender(TEXT_TATE_SCRIPT, args, function (err, code) {
+    if (err || code !== 0) {
+      _leaseErrorPageSent = false
+      process.stderr.write('[scheduler] LEASE OUTAGE PAGE send FAILED (code=' + code +
+        (err ? ', err=' + (err.message || err) : '') + '); unlatched, will retry next pass\n')
+    } else {
+      process.stderr.write('[scheduler] LEASE OUTAGE PAGE delivered (text-tate exit 0); latched for this outage\n')
+    }
+  })
+  // Independent leg. A pooler-caused outage cannot write this, which is the whole
+  // reason the page above does not depend on it.
+  exports.writeLeaseOutageBoardRow(crumb).then(function (ok) {
+    if (ok) process.stderr.write('[scheduler] lease outage board row written\n')
+  }).catch(function () {})
+  process.stderr.write('[scheduler] LEASE OUTAGE PAGE fired after ' + _consecutiveLeaseErrors +
+    ' consecutive lease exceptions (~' + stalledMin + 'min stalled)\n')
+  return { command: 'node ' + TEXT_TATE_SCRIPT + ' ' + args.map(a => JSON.stringify(a)).join(' '), args, message: msg }
+}
+
+// Called after a lease pass RETURNS (the only proof leasing works). Resets the
+// tracker and flushes a held breadcrumb to the board, which is how a DB-caused
+// outage still gets its row. Cannot throw: it runs on the hot dispatch path.
+exports.noteLeaseOk = function noteLeaseOk(nowMs) {
+  const now = nowMs || Date.now()
+  _lastLeaseOkAt = now
+  if (_consecutiveLeaseErrors === 0 && !_leaseErrorPageSent) return null
+  const recovered = {
+    consecutive: _consecutiveLeaseErrors,
+    paged: _leaseErrorPageSent,
+    firstAt: _leaseErrorFirstAt,
+    lastMsg: _leaseErrorLastMsg,
+  }
+  process.stderr.write('[scheduler] lease path recovered; clearing lease-outage tracker (was ' +
+    _consecutiveLeaseErrors + ' consecutive errors, paged=' + _leaseErrorPageSent + ')\n')
+  const held = _readLeaseBreadcrumb()
+  _consecutiveLeaseErrors = 0
+  _leaseErrorFirstAt = null
+  _leaseErrorLastMsg = ''
+  _leaseErrorPageSent = false
+  if (held && held.paged) {
+    held.recovered_at = new Date(now).toISOString()
+    exports.writeLeaseOutageBoardRow(held).then(function (ok) {
+      if (ok) { _clearLeaseBreadcrumb(); process.stderr.write('[scheduler] held lease-outage breadcrumb flushed to status_board\n') }
+    }).catch(function () {})
+  } else {
+    _clearLeaseBreadcrumb()
+  }
+  return recovered
+}
+
 // ── Runaway dispatch circuit breaker (Hunter 4 #7, 2026-08-13) ────────────────
 //
 // Survival-critical. The ONLY pre-existing protection is account-level: the usage
@@ -4431,8 +4660,14 @@ exports.schedulerHealthSnapshot = function schedulerHealthSnapshot() {
     dispatch_pass_running: _dispatchPassRunning,
     dispatch_pass_age_ms: _dispatchPassStartedAt ? (now - _dispatchPassStartedAt) : 0,
     dispatch_pass_max_ms: DISPATCH_PASS_MAX_MS,
+    // last_lease_pass_at is stamped on the THROW path too - it proves the interval is
+    // ticking, NOT that leasing works. Read last_lease_ok_at for that.
     last_lease_pass_at: _lastLeasePassAt ? new Date(_lastLeasePassAt).toISOString() : null,
     ms_since_last_lease_pass: _lastLeasePassAt ? (now - _lastLeasePassAt) : null,
+    last_lease_ok_at: _lastLeaseOkAt ? new Date(_lastLeaseOkAt).toISOString() : null,
+    ms_since_last_lease_ok: _lastLeaseOkAt ? (now - _lastLeaseOkAt) : null,
+    consecutive_lease_errors: _consecutiveLeaseErrors,
+    lease_outage_paged: _leaseErrorPageSent,
     dispatch_wedge_resets: _dispatchWedgeResets,
     armed: !!(exports._intervals && exports._intervals.dispatchInterval),
   }
@@ -4505,8 +4740,24 @@ exports.start = function start() {
       try {
         rows = await exports.leaseDueRows(DISPATCH_LIMIT)
       } catch (e) {
-        process.stderr.write('[scheduler] leaseDueRows error: ' + e.message + '\n')
+        // 2026-09-07 lane D1. This catch used to log and return, and that was the
+        // whole of the response: 7h55m of total fleet death on 2026-09-06 produced
+        // 24,273 of these lines and not one alert. noteLeaseError counts consecutive
+        // throws and pages Tate over iMessage (a path that does not need the DB that
+        // is usually the cause). The log line normalises an EMPTY e.message, which is
+        // the shape the live log actually carried.
+        process.stderr.write('[scheduler] leaseDueRows error: ' +
+          (((e && e.message) || String(e || '')).trim() || '(empty message)') + '\n')
+        try { exports.noteLeaseError(e) } catch (_pageErr) {}
         return
+      }
+      // Leasing RETURNED. This is the only proof the lease path works, and it is the
+      // only place the recovery flush can honestly run.
+      // Logged, not swallowed. A silently-throwing recovery hook would leave the
+      // lease-outage counter latched forever and the next real outage unreported,
+      // which is the same invisible-failure class this whole block exists to end.
+      try { exports.noteLeaseOk() } catch (okErr) {
+        process.stderr.write('[scheduler] noteLeaseOk error: ' + ((okErr && okErr.message) || okErr) + '\n')
       }
       // 2026-07-17 batch-aging fix. This loop awaits dispatchOne SERIALLY, so
       // rows 3..N of a leased batch are not yet inside dispatchOne (and thus
@@ -4540,7 +4791,12 @@ exports.start = function start() {
     } finally {
       _dispatchPassRunning = false
       _dispatchPassStartedAt = 0
-      _lastLeasePassAt = Date.now()   // heartbeat: a pass reached its finally (leasing is alive)
+      // NOT a leasing-alive heartbeat, whatever it was named. This finally runs on the
+      // THROW path too, so through the whole 2026-09-06 lease outage this stamp stayed
+      // fresh every 30s while zero rows were leased. It measures "a pass reached its
+      // finally", nothing more. The honest liveness signal is _lastLeaseOkAt, stamped
+      // by noteLeaseOk only when leaseDueRows actually returned.
+      _lastLeasePassAt = Date.now()
     }
   }, POLL_INTERVAL_MS)
 
