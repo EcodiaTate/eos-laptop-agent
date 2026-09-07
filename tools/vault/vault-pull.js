@@ -301,6 +301,8 @@ async function recordBalances(db, balances, asOfDate, opts = {}) {
     const note = `phone-vault-feed ${asOfDate} via vault-pull.js normaliser: current ${(b.curr_cents / 100).toFixed(2)}`
       + (avail == null ? '' : `, available ${(avail / 100).toFixed(2)}${uncleared ? `, uncleared ${(uncleared / 100).toFixed(2)}` : ''}`)
       + (opts.carriedForwardFrom ? ` (CARRIED FORWARD: empty statement, dormant account, balance unchanged since ${opts.carriedForwardFrom})` : '')
+      + (opts.observedTxnDate && opts.observedTxnDate !== asOfDate
+        ? ` (NO MOVEMENT SINCE ${opts.observedTxnDate}: balance read off that transaction, account observed ${asOfDate})` : '')
     const res = await db`INSERT INTO public.bank_reconciliation
       (id, account_code, as_of_date, bank_balance, ledger_balance, difference, status, notes)
       SELECT gen_random_uuid(), ${account}, ${asOfDate}, ${b.curr_cents}, 0, 0, 'reconciled', ${note}
@@ -461,8 +463,35 @@ async function importBankCsv(db, csvText, sourceAccount, asOfDate) {
   let balances = {}
   let carriedForwardFrom = null
   if (liveBalance != null) {
-    const asOf = liveBalanceDate || asOfDate || new Date().toISOString().slice(0, 10)
-    balances = await recordBalances(db, { [sourceAccount]: { curr_cents: liveBalance } }, asOf)
+    // AS-OF IS THE OBSERVATION DATE, NOT THE MOVEMENT DATE.
+    //
+    // liveBalanceDate is the `occurred` date of the NEWEST TRANSACTION (parseBaCsvRows), which is
+    // when the money last moved. It is NOT when we looked. Stamping as_of_date with it says the
+    // balance is only known as far back as the last transaction, and that is false: the export
+    // rendered the account's own history page at asOfDate, so the running balance on the newest
+    // row IS the balance at asOfDate. No transactions since simply means it has not changed.
+    //
+    // The bug this fixes: a DORMANT account whose last transaction is old but still inside BA's
+    // export window takes THIS branch, not the carry-forward branch below, because one old
+    // transaction is enough to make liveBalance non-null. It is then re-stamped at that same old
+    // date on every single tap, so it ages forever and no export can ever refresh it. Only once
+    // the transaction slides out of the export window does the CSV go header-only and the
+    // carry-forward branch become reachable. Measured on ba_personal_savings: the 2026-09-05 tap
+    // covered it (vault_inbox 34071a81, sig_verified, consumed 02:44:15Z), its CSV held exactly
+    // one row dated 31/08/2026 for a $0.01 interest credit, and the account was stamped 2026-08-31
+    // for the second time and read 7d stale while the export proving the balance was 2d old.
+    //
+    // The carry-forward branch below fixed only the strictly-empty case, and its non-empty control
+    // could not have caught this: that fixture used a transaction dated 31/08 with asOfDate
+    // 31/08, so both orderings of this expression produce the identical answer.
+    //
+    // Masking risk, handled rather than accepted: stamping the observation date would hide a
+    // stale CSV served by the bank. So when the newest movement predates the observation, the
+    // note records BOTH (see recordBalances), keeping the movement date visible to a human and
+    // to any surface that wants it.
+    const asOf = asOfDate || liveBalanceDate || new Date().toISOString().slice(0, 10)
+    balances = await recordBalances(db, { [sourceAccount]: { curr_cents: liveBalance } }, asOf,
+      { observedTxnDate: liveBalanceDate })
   } else if (rows.length === 0) {
     // DORMANT-ACCOUNT CARRY-FORWARD.
     //

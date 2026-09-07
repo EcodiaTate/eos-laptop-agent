@@ -119,6 +119,76 @@ t('CONTROL: a NON-empty statement is untouched and still stamps its own observed
   assert.ok(!/CARRIED FORWARD/.test(w.notes), 'an observed balance is never marked as carried')
 })
 
+// ---------------------------------------------------------------------------------------------
+// OBSERVATION DATE vs MOVEMENT DATE.
+//
+// The cases above all use a transaction dated the SAME day as the export, so they cannot tell
+// `asOfDate || liveBalanceDate` from `liveBalanceDate || asOfDate`: both orderings return the
+// identical string. That coincidence is why the real defect survived a green suite. Every case
+// below deliberately separates the two dates, so each one goes red if the ordering is reverted.
+//
+// The live shape being pinned: ba_personal_savings on the 2026-09-05 tap. Its CSV was NOT empty
+// (so the carry-forward branch above is unreachable), it held exactly one row dated 31/08/2026,
+// and it was stamped 2026-08-31 for the second running while the export proving the balance was
+// two days old. A dormant account whose last movement is still inside BA's export window can
+// therefore never be refreshed by any number of taps.
+
+// The EXACT payload the 2026-09-05 export returned for ba_personal_savings, decoded from
+// vault_inbox 34071a81-5169-4e68-97a2-ba0a9cf9e235.
+const DORMANT_ONE_OLD_TXN_CSV = 'Effective Date,Entered Date,Transaction Description,Amount,Balance\r\n'
+  + ',31/08/2026,"Interest Credit",$0.01,$0.01\r\n'
+
+t('a dormant account with ONE OLD txn stamps the OBSERVATION date, not the movement date', async () => {
+  const m = makeMockDb(PRIOR)
+  const out = await importBankCsv(m.db, DORMANT_ONE_OLD_TXN_CSV, 'ba_personal_savings', '2026-09-05')
+  assert.strictEqual(out.liveBalance, 1, 'the balance is observed, so carry-forward must not fire')
+  assert.strictEqual(out.carriedForwardFrom, null, 'this is the OBSERVED branch, not the carried one')
+  assert.ok(m.recon.some(r => r.as_of_date === '2026-09-05'),
+    'the export date is what we observed the balance at')
+  assert.ok(!m.recon.some(r => r.account_code === 'ba_personal_savings' && r.as_of_date === '2026-08-31'),
+    'stamping the old transaction date is the defect: it can never be refreshed by a later tap')
+})
+
+t('the note keeps the MOVEMENT date visible, so a stale-CSV read is not masked', async () => {
+  const m = makeMockDb(PRIOR)
+  await importBankCsv(m.db, DORMANT_ONE_OLD_TXN_CSV, 'ba_personal_savings', '2026-09-05')
+  const w = m.recon.find(r => r.as_of_date === '2026-09-05')
+  assert.ok(/^phone-vault-feed/.test(w.notes), 'prefix stays load-bearing for the NOT-EXISTS guard')
+  assert.ok(/NO MOVEMENT SINCE 2026-08-31/.test(w.notes), 'the movement date must remain readable')
+  assert.ok(/observed 2026-09-05/.test(w.notes), 'and it must say when we actually looked')
+  assert.ok(!/CARRIED FORWARD/.test(w.notes), 'an observed balance is never marked as carried')
+})
+
+t('a REPEAT tap of a dormant account advances as_of_date (the whole point: it can be refreshed)', async () => {
+  const m = makeMockDb(PRIOR)
+  await importBankCsv(m.db, DORMANT_ONE_OLD_TXN_CSV, 'ba_personal_savings', '2026-09-05')
+  await importBankCsv(m.db, DORMANT_ONE_OLD_TXN_CSV, 'ba_personal_savings', '2026-09-12')
+  const dates = m.recon.filter(r => r.account_code === 'ba_personal_savings').map(r => r.as_of_date).sort()
+  assert.ok(dates.includes('2026-09-05') && dates.includes('2026-09-12'),
+    'each tap stamps its own observation date, so the account tracks the feed rather than freezing')
+})
+
+t('CONTROL: an ACTIVE account whose txn IS the export day is unchanged (same date either way)', async () => {
+  const m = makeMockDb(PRIOR)
+  const csv = 'Effective Date,Entered Date,Transaction Description,Amount,Balance\r\n'
+    + ',05/09/2026,"Card purchase",$-12.50,$99.30\r\n'
+  await importBankCsv(m.db, csv, 'ba_ecodia', '2026-09-05')
+  const w = m.recon.find(r => r.account_code === 'ba_ecodia')
+  assert.strictEqual(w.as_of_date, '2026-09-05', 'unchanged for the common active-account case')
+  assert.ok(!/NO MOVEMENT SINCE/.test(w.notes),
+    'no marker when the movement IS the observation: the marker must mean something')
+})
+
+t('CONTROL: a ts-less read still falls back to the movement date rather than inventing today', async () => {
+  const m = makeMockDb(PRIOR)
+  await importBankCsv(m.db, DORMANT_ONE_OLD_TXN_CSV, 'ba_personal_savings', null)
+  const today = new Date().toISOString().slice(0, 10)
+  assert.ok(m.recon.some(r => r.as_of_date === '2026-08-31'),
+    'with no export ts, the newest transaction date is the best evidence we have')
+  assert.ok(!m.recon.some(r => r.as_of_date === today && today !== '2026-08-31'),
+    'and it must not claim today when nothing proves today')
+})
+
 Promise.all(results).then(() => {
   console.log(`\nvault-pull dormant carry-forward: ${pass} passed`)
 }).catch((e) => { console.error('FAILED:', e.message); process.exit(1) })
