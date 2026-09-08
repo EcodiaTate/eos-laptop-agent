@@ -91,6 +91,24 @@ write(SWEPT_NOCRED, { task_id: 't-swept-nocred', registered_at: iso(nowMs - 70 *
   last_heartbeat_at: iso(nowMs - 65 * 60_000), terminated_at: iso(nowMs - 5 * 60_000),
   terminated_reason: 'stale_heartbeat', stale_at_termination_ms: 3_900_000 })
 
+// 2026-09-09 lane coord-L1 VERIFY-3 (independent third pass). THE PLUMBING DRIFT.
+// 787d97e's message says the shared helper means the explicit heartbeat handler
+// and the implicit touch "cannot drift on the new rule". That is true of the
+// RULE and false of the ARGUMENT. The credential is passed at three separate
+// call sites, and this suite drove exactly one of them. Measured: dropping the
+// credential at coord.js heartbeat() or at index.js:152 left the suite at 35/35,
+// so two thirds of the wiring the fix depends on was asserted by nobody.
+// This row is dedicated to the EXPLICIT handler because every row above is
+// already revived by the time 2d runs, and a revived row cannot fail a revive
+// test. The route SKIPS its own touch for `heartbeat` (short !== 'heartbeat'),
+// so a revive on this path can only have come from coord.js heartbeat() itself.
+const CRED_HB = 'cred-swept-hbeat-0000'
+const SWEPT_HB = 'tab_17888800000010_77777777'
+write(SWEPT_HB, { task_id: 't-swept-hb', registered_at: iso(nowMs - 70 * 60_000),
+  last_heartbeat_at: iso(nowMs - 65 * 60_000), terminated_at: iso(nowMs - 5 * 60_000),
+  terminated_reason: 'stale_heartbeat', stale_at_termination_ms: 3_900_000,
+  tab_credential: CRED_HB })
+
 const coord = require('./coord')
 const mcp = require('../routes/mcpCoord')
 
@@ -275,6 +293,81 @@ async function part1() {
   check(hbRes && !hbRes.isError && hbRes.body && hbRes.body.ok === true,
     '2d the explicit coord.heartbeat handler still works and is not shadowed')
 
+  // 2k. THE EXPLICIT HEARTBEAT PATH, credential-gated, as a PAIR on one row.
+  //     coord.heartbeat is the STRONGEST proof of life a worker can send and the
+  //     boot envelope tells every worker to send it twice a turn, so it is the
+  //     path with the largest real population - and until this case it was the
+  //     path whose credential argument nothing asserted. Only the credential
+  //     differs between the two halves, per T7: a refusal-only control cannot
+  //     tell a designed refusal from a feature that was never wired.
+  const hbBefore = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_HB + '.json'), 'utf8'))
+  const hbWrong = await mcp._callToolForTest('coord.heartbeat', {}, { tab_id: SWEPT_HB, tab_credential: CRED_ALIVE })
+  const hbAfterWrong = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_HB + '.json'), 'utf8'))
+  check(hbWrong && !hbWrong.isError && hbAfterWrong.terminated_at === hbBefore.terminated_at && !hbAfterWrong.revived_at,
+    '2k REFUSE HALF: an explicit heartbeat carrying another tab\'s credential does not revive')
+  const hbRight = await mcp._callToolForTest('coord.heartbeat', {}, { tab_id: SWEPT_HB, tab_credential: CRED_HB })
+  const hbAfterRight = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_HB + '.json'), 'utf8'))
+  check(hbRight && !hbRight.isError && hbAfterRight.terminated_at === null && !!hbAfterRight.revived_at,
+    '2k ALLOW HALF: the SAME row and the SAME call revive once the row\'s own credential is presented')
+  check(hbAfterRight.revived_from === 'stale_heartbeat',
+    '2k WHY the refusal above is designed and not incidental: only the credential differed')
+
+  // 2k-drift. THE NAMED DRIFT, pinned rather than left as prose. heartbeat()
+  //     writes last_heartbeat_at and persists UNCONDITIONALLY, where the implicit
+  //     _touchHeartbeatForTab returns false before writing when terminated_at is
+  //     set. So a REFUSED explicit heartbeat still moves the clock on a dead row.
+  //     Impact is nil today because every consumer governs on terminated_at,
+  //     which stays set - and that is exactly why it needs a pin: the day a
+  //     consumer starts governing on last_heartbeat_at, this case is what fails.
+  check(hbAfterWrong.last_heartbeat_at !== hbBefore.last_heartbeat_at,
+    '2k-drift a REFUSED explicit heartbeat still bumps last_heartbeat_at on a row it left dead')
+  check(hbAfterWrong.terminated_at !== null,
+    '2k-drift WHY it is harmless TODAY: terminated_at is untouched, and that is what consumers govern on')
+
+  // 2l. THE THIRD CALL SITE, index.js:152, asserted by SOURCE SHAPE and not by
+  //     behaviour. Say that plainly: per doctrine
+  //     [[the-pure-function-is-tested-the-wiring-is-grepped]] a source assertion
+  //     fails on SPELLING, not on behaviour, and is the weakest evidence in this
+  //     file. It is here anyway because requiring index.js boots a SECOND full
+  //     agent inside the suite - scheduler, sweep loop, tab dispatch - against a
+  //     live launchd instance, which is a worse risk than the one it would close.
+  //     Pinned to the ARGUMENT rather than to the helper name: an import line or
+  //     a bare one-arg call satisfies the name and silently kills the revive.
+  //     Blast radius is genuinely small - /api/tool needs the agent bearer, which
+  //     no dispatched worker holds, and it SKIPS the coord.* family - so this
+  //     path's real population is close to zero. It is pinned so a future edit
+  //     that widens that population does not inherit a dark revive.
+  const idxSrc = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8')
+  check(/_touchHeartbeatForTab\(\s*ctx\.tab_id\s*,\s*ctx\.tab_credential\s*\)/.test(idxSrc),
+    '2l index.js /api/tool passes the credential too (SOURCE-SHAPE assertion, see the note above)')
+
+  // 2m. THE GATE'S OWN DARK SWITCH. Every guard above is worthless the day the
+  //     dispatched-worker boot envelope stops carrying the credential: workers
+  //     would present nothing, every revive would be REFUSED, and the symptom is
+  //     indistinguishable from "nothing needed reviving". That is the dark-wire
+  //     class this whole lane started on, so it gets a mechanism and not a note.
+  //     NOT a rate canary on the [coord-revive] REFUSED lines. Revives are a
+  //     near-zero-population event (a worker must outlive the 60min sweep bound
+  //     and then call coord), so such a canary would carry a zero baseline and
+  //     could never separate "gate dark" from "nothing to revive" - the exact
+  //     defect in [[a-floor-alarm-cannot-tell-whether-its-baseline-was-ever-real]].
+  //     Pinned deterministically at the source instead, on a population of every
+  //     dispatched brief.
+  //     It asserts the VALUE is interpolated, not that the WORD appears.
+  //     brief-send-origin.test.js:71 already checks `b.includes('tab_credential')`
+  //     and that assertion is satisfied by the token sitting in prose, so a
+  //     _composeBrief that stopped substituting would keep it green. This is the
+  //     import-line failure named in [[the-pure-function-is-tested-the-wiring-is-grepped]].
+  const { _composeBrief } = require('./mac-dispatcher.js')
+  const CRED_SENTINEL = 'CRED-SENTINEL-2m-4f19ab'
+  const brief2m = _composeBrief({
+    tab_id: 'tab_2m_test', task_id: 'task-2m', tab_credential: CRED_SENTINEL,
+    conductor_inbox: 'chat.conductor.inbox', brief_storage: 'inline', brief_body: 'x' })
+  check(brief2m.includes(CRED_SENTINEL),
+    '2m the dispatched brief carries the credential VALUE, so a worker can present it')
+  check((brief2m.match(new RegExp(CRED_SENTINEL, 'g')) || []).length > 1,
+    '2m WHY not just the sentinel line: the coord CALL EXAMPLES carry it too, which is what a worker copies')
+
   // 2e. A NON-registered tab is a silent no-op, never a crash or a phantom row.
   const r5 = await mcp._callToolForTest('coord.list_channels', {}, { tab_id: 'tab_17888800000009_ffffffff' })
   check(r5 && r5.isError !== true, '2e an unregistered tab_id does not break the call')
@@ -311,6 +404,26 @@ async function part1() {
 //   2j  coord.js _reviveIfManufacturedDeath: delete `if (!w.tab_credential) return false`
 //       and 2j goes red while both halves of 2i stay green - the two guards are
 //       separate rules and each has a fixture only it can fail.
+//   2m  tools/mac-dispatcher.js _composeBrief: replace the interpolated
+//       `tab_credential` with the literal word (keep every mention, drop the
+//       substitution) and 2m goes red while brief-send-origin.test.js:71 stays
+//       GREEN, because that assertion checks the token and this one checks the
+//       value. That divergence IS the case: it is the one mutation under which
+//       the credential gate goes dark fleet-wide and every other test agrees.
+//   2k  coord.js heartbeat(): change `_reviveIfManufacturedDeath(w, ctx.tab_credential)`
+//       to `_reviveIfManufacturedDeath(w)` and the ALLOW half of 2k goes red while
+//       its refuse half stays green. BEFORE 2k existed this mutation left the whole
+//       suite at 35/35: the explicit handler is the path with the LARGEST worker
+//       population and its credential argument was asserted nowhere.
+//   2k-drift  coord.js heartbeat(): move `w.last_heartbeat_at = ...` below a
+//       `if (w.terminated_at) return ...` guard and the drift pin goes red. That
+//       edit would be an IMPROVEMENT, so this case is a tripwire on a known
+//       divergence, not a defence of it - read the note on the case before "fixing".
+//   2l  index.js:152: drop the second argument from the _touchHeartbeatForTab call
+//       and 2l goes red. Weakest control in the file by construction: it asserts
+//       spelling. Deleting the whole call also reddens it, which proves nothing
+//       extra - the mutant that matters is the one that KEEPS the call and drops
+//       the argument, which is the drift this pin exists for.
 //   2i  routes/mcpCoord.js: drop the second argument from the
 //       `coord._touchHeartbeatForTab(ctx.tab_id, ctx.tab_credential)` call and
 //       the ALLOW half of 2i goes red while both refuse halves stay green - the
