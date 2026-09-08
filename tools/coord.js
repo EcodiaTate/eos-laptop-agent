@@ -3343,6 +3343,10 @@ async function list_workers(params, ctx) {
       // sweep manufactured this from heartbeat age and it is NOT proof of death.
       terminated_reason: w.terminated_reason || null,
       stale_at_termination_ms: w.stale_at_termination_ms || null,
+      // Non-null = this row was stamped 'stale_heartbeat' by the sweep and then
+      // proved itself alive with a real coord call. Its earlier death was
+      // manufactured, not observed.
+      revived_at: w.revived_at || null,
       dead: is_dead,
     })
   }
@@ -3355,6 +3359,10 @@ async function heartbeat(params, ctx) {
   if (!ctx.tab_id) return { ok: false, error: 'tab_id required (X-Tab-Id header or params.tab_id)' }
   const w = workers.get(ctx.tab_id)
   if (!w) return { ok: false, error: 'worker not registered: ' + ctx.tab_id }
+  // Same revive as the implicit path (_touchHeartbeatForTab). Shared helper on
+  // purpose: two copies of this rule would drift, and an explicit heartbeat is
+  // the STRONGEST proof of life a worker can send.
+  _reviveIfManufacturedDeath(w)
   w.last_heartbeat_at = new Date().toISOString()
   if (params.status) w.status = String(params.status).slice(0, 500)
   if (typeof params.in_critical_section === 'boolean') w.in_critical_section = params.in_critical_section
@@ -3368,10 +3376,49 @@ async function heartbeat(params, ctx) {
 // (Read, Bash, db_execute, etc) and shouldn't have to explicitly heartbeat
 // between them. Non-throwing. Returns false silently for non-worker tabs
 // (conductors, ad-hoc calls) so the middleware can call it unconditionally.
+// 2026-09-09 lane coord-L1 VERIFY (independent second pass on d1bb21f).
+// terminated_at has TWO provenances and only one of them is proof of death.
+// sweepStaleWorkers (~L4429) manufactures it from heartbeat age ALONE, stamping
+// terminated_reason 'stale_heartbeat'. d1bb21f exposed that discriminator to
+// CONSUMERS (list_workers now returns terminated_reason) but still discarded it
+// HERE, at the one point inside coord where a worker can prove the sweep wrong.
+// Measured on the deployed path: a worker stamped 'stale_heartbeat' that then
+// made a SUCCESSFUL coord.peek_inbox had its heartbeat refused, stayed hidden
+// from list_workers({include_dead:false}), and read "not live" to the scheduler,
+// indistinguishable from a real signal_done. So the laundering d1bb21f set out
+// to kill survived one layer down: the wire it reconnected is precisely the wire
+// a swept worker can never reconnect.
+//
+// A successful coord call IS proof of life - the tab made it. A manufactured
+// death must yield to that proof; a real terminal event must never be reversible
+// by a straggler call. Fail-closed on the exact string: terminated_at has exactly
+// two writers in this file (signal_done and the sweep) and each always pairs a
+// reason, so anything that is not literally 'stale_heartbeat' stays dead.
+// closed_tab_ok is a bridge-CONFIRMED tab close, which is contradictory evidence,
+// so those stay dead too.
+//
+// Deliberately does NOT recreate the .spawned marker the sweep unlinked. That is
+// a separate signal whose body carries spawn time, and forging a fresh one would
+// report a long-running worker as newly spawned to cowork.list_workers (~L972).
+// Named as a known adjacent gap rather than silently widened here.
+function _reviveIfManufacturedDeath(w) {
+  if (!w || !w.terminated_at) return false
+  if (w.terminated_reason !== 'stale_heartbeat') return false
+  if (w.closed_tab_ok === true) return false
+  w.terminated_at = null
+  w.terminated_reason = null
+  w.stale_at_termination_ms = null
+  w.revived_at = new Date().toISOString()
+  w.revived_from = 'stale_heartbeat'
+  return true
+}
+
 function _touchHeartbeatForTab(tab_id) {
   if (!tab_id) return false
   const w = workers.get(tab_id)
   if (!w) return false
+  // Proof of life outranks a death this process manufactured from silence.
+  _reviveIfManufacturedDeath(w)
   if (w.terminated_at) return false
   w.last_heartbeat_at = new Date().toISOString()
   try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}

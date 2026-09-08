@@ -54,6 +54,20 @@ write(DONE, { task_id: 't-done', registered_at: iso(nowMs - 20 * 60_000),
   last_heartbeat_at: iso(nowMs - 6 * 60_000), terminated_at: iso(nowMs - 5 * 60_000),
   terminated_reason: 'signal_done' })
 
+// 2026-09-09 lane coord-L1 VERIFY. The revive cases. A worker the SWEEP condemned
+// from silence alone, which is then demonstrably alive because it makes a coord
+// call. d1bb21f returned terminated_reason to consumers but still discarded it
+// inside _touchHeartbeatForTab, so this worker could never get its wire back.
+const SWEPT_ALIVE = 'tab_17888800000005_eeeeeeee'  // manufactured death, then proves life
+const SWEPT_CLOSED = 'tab_17888800000006_ffffffff' // manufactured death BUT tab confirmed closed
+write(SWEPT_ALIVE, { task_id: 't-swept-alive', registered_at: iso(nowMs - 70 * 60_000),
+  last_heartbeat_at: iso(nowMs - 65 * 60_000), terminated_at: iso(nowMs - 5 * 60_000),
+  terminated_reason: 'stale_heartbeat', stale_at_termination_ms: 3_900_000 })
+write(SWEPT_CLOSED, { task_id: 't-swept-closed', registered_at: iso(nowMs - 70 * 60_000),
+  last_heartbeat_at: iso(nowMs - 65 * 60_000), terminated_at: iso(nowMs - 5 * 60_000),
+  terminated_reason: 'stale_heartbeat', stale_at_termination_ms: 3_900_000,
+  closed_tab_ok: true })
+
 const coord = require('./coord')
 const mcp = require('../routes/mcpCoord')
 
@@ -166,6 +180,40 @@ async function part1() {
   check(doneAfter.terminated_at === doneBefore.terminated_at,
     '2c WHY: its terminated_at is untouched, so signal_done stays final')
 
+  // 2f. THE REVIVE. A death this process MANUFACTURED from silence must yield to
+  //     proof of life; the same call must NOT revive a real terminal event. The
+  //     pair is the point: 2c above and 2f here drive the identical code path and
+  //     must disagree, which is what proves the discriminator is being read.
+  const swBefore = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_ALIVE + '.json'), 'utf8'))
+  const swRes = await mcp._callToolForTest('coord.list_channels', {}, { tab_id: SWEPT_ALIVE })
+  const swAfter = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_ALIVE + '.json'), 'utf8'))
+  check(swRes.isError === false,
+    '2f the swept worker\'s coord call SUCCEEDS (it is alive - the tab made the call)')
+  check(swAfter.terminated_at === null && swBefore.terminated_at !== null,
+    '2f a MANUFACTURED death (terminated_reason stale_heartbeat) is cleared by proof of life')
+  check(swAfter.last_heartbeat_at !== swBefore.last_heartbeat_at,
+    '2f WHY it matters: its heartbeat wire is reconnected, which the sweep had made unreachable')
+  check(swAfter.revived_from === 'stale_heartbeat' && !!swAfter.revived_at,
+    '2f the revive is RECORDED, so a consumer can see the earlier death was not observed')
+
+  // 2g. FAIL-CLOSED CONTROL. Same manufactured reason, but the IDE bridge
+  //     confirmed the tab closed. Contradictory evidence: stays dead.
+  const scBefore = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_CLOSED + '.json'), 'utf8'))
+  await mcp._callToolForTest('coord.list_channels', {}, { tab_id: SWEPT_CLOSED })
+  const scAfter = JSON.parse(fs.readFileSync(path.join(WORKERS_DIR, SWEPT_CLOSED + '.json'), 'utf8'))
+  check(scAfter.terminated_at === scBefore.terminated_at,
+    '2g closed_tab_ok=true is NOT revived: a bridge-confirmed close outranks a straggler call')
+  check(scAfter.last_heartbeat_at === scBefore.last_heartbeat_at,
+    '2g WHY: so the revive is keyed on evidence, not merely on the reason string')
+
+  // 2h. The revived worker is now VISIBLE where the manufactured death hid it.
+  const lwRevived = await coord.list_workers({ include_dead: false })
+  const revivedIds = (lwRevived.workers || []).map(x => x.tab_id)
+  check(revivedIds.includes(SWEPT_ALIVE),
+    '2h the revived worker reappears in include_dead:false, where the sweep had hidden it')
+  check(!revivedIds.includes(SWEPT_CLOSED) && !revivedIds.includes(DONE),
+    '2h WHY it is not just a widened filter: the closed tab and the signal_done row stay hidden')
+
   // 2d. The explicit heartbeat path is not double-written by the new touch.
   const hbRes = await mcp._callToolForTest('coord.heartbeat', {}, { tab_id: STALE })
   check(hbRes && !hbRes.isError && hbRes.body && hbRes.body.ok === true,
@@ -193,3 +241,8 @@ async function part1() {
 //   2b  mcpCoord.js callTool: move the touch ABOVE the handler await
 //       (this mutation is what exposed 2b agreeing rather than working - see the case)
 //   2c  coord.js _touchHeartbeatForTab: delete `if (w.terminated_at) return false`
+//   2f  coord.js _reviveIfManufacturedDeath: delete the `_reviveIfManufacturedDeath(w)`
+//       call from _touchHeartbeatForTab (the 2026-09-09 verify-pass correction)
+//   2g  coord.js _reviveIfManufacturedDeath: delete `if (w.closed_tab_ok === true) return false`
+//   2f/2c pair: change the reason test to `if (!w.terminated_reason) return false`
+//       and 2c goes red while 2f stays green - proof the pair discriminates
