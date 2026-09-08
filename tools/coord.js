@@ -3361,8 +3361,10 @@ async function heartbeat(params, ctx) {
   if (!w) return { ok: false, error: 'worker not registered: ' + ctx.tab_id }
   // Same revive as the implicit path (_touchHeartbeatForTab). Shared helper on
   // purpose: two copies of this rule would drift, and an explicit heartbeat is
-  // the STRONGEST proof of life a worker can send.
-  _reviveIfManufacturedDeath(w)
+  // the STRONGEST proof of life a worker can send. The credential travels with
+  // it for the same reason: a rule enforced in one of the two paths is not
+  // enforced.
+  _reviveIfManufacturedDeath(w, ctx.tab_credential)
   w.last_heartbeat_at = new Date().toISOString()
   if (params.status) w.status = String(params.status).slice(0, 500)
   if (typeof params.in_critical_section === 'boolean') w.in_critical_section = params.in_critical_section
@@ -3401,24 +3403,68 @@ async function heartbeat(params, ctx) {
 // a separate signal whose body carries spawn time, and forging a fresh one would
 // report a long-running worker as newly spawned to cowork.list_workers (~L972).
 // Named as a known adjacent gap rather than silently widened here.
-function _reviveIfManufacturedDeath(w) {
+//
+// 2026-09-09 lane coord-L1 VERIFY-2. THE THIRD GUARD, and the one the first
+// verify pass named as a premise rather than a mechanism. Its item 5 said the
+// residual false-presence was acceptable "because only a LIVE tab can trigger a
+// revive". Nothing enforced that. routes/mcpCoord.js:450 keys the touch on
+// ctx.tab_id ALONE, and that ctx is built from an X-Tab-Id header or a plain
+// params.tab_id (extractCtx, ~L396) which nothing authenticates; the file's own
+// header says so ("mismatched-cred calls still go through"). Before e7ab40c an
+// asserted tab_id could only bump a clock on a row that was already live. After
+// it, the same unauthenticated assertion could CLEAR a terminated_at. So the
+// escalation shipped with the correction and was invisible because the old
+// power looked like the new one.
+// Measured before shipping this guard: 1,915 of 1,915 worker coord calls over
+// 24h carry tab_credential, 0 assert a tab_id that is not the caller's own, and
+// 47 of 47 presented credentials match the credential stored on the row. So
+// requiring it costs no real caller anything.
+// FAIL-SAFE, not fail-closed-into-the-dark: a missing or wrong credential only
+// declines the REVIVE. The plain heartbeat bump on a live row is untouched, so
+// the dark-wire fix of d1bb21f cannot regress through this path. A declined
+// revive leaves the row exactly as e7ab40c found it: dead, and re-reviveable by
+// the next call that does present the credential.
+function _reviveIfManufacturedDeath(w, presented_credential) {
   if (!w || !w.terminated_at) return false
   if (w.terminated_reason !== 'stale_heartbeat') return false
   if (w.closed_tab_ok === true) return false
+  // A row with no stored credential cannot prove anything, so it stays dead.
+  // BOTH refusals are logged. 1,915 of 1,915 worker calls carry a credential
+  // today only because the boot envelope templates one in, so if that template
+  // ever stops the gate goes dark and every revive silently stops firing. A
+  // silent refusal is the same defect class as the dark wire this lane started
+  // on: the absence looks identical to "nothing needed reviving". Counting the
+  // refusals is what makes a dark gate visible.
+  if (!w.tab_credential || presented_credential !== w.tab_credential) {
+    try {
+      process.stderr.write('[coord-revive] REFUSED ' + (w.tab_id || '?') + ': ' +
+        (w.tab_credential ? (presented_credential ? 'credential mismatch' : 'no credential presented')
+                          : 'row stores no credential') + '\n')
+    } catch (e) {}
+    return false
+  }
+  const was = w.terminated_at
   w.terminated_at = null
   w.terminated_reason = null
   w.stale_at_termination_ms = null
   w.revived_at = new Date().toISOString()
   w.revived_from = 'stale_heartbeat'
+  // A revive left NO trace anywhere, which made "did the correction ever fire on
+  // a real worker" unanswerable by construction: every pass could only inspect
+  // rows that survived the 24h GC. One stderr line makes it a countable event.
+  try {
+    process.stderr.write('[coord-revive] ' + (w.tab_id || '?') + ' proved alive after a manufactured death stamped ' + was + '\n')
+  } catch (e) {}
   return true
 }
 
-function _touchHeartbeatForTab(tab_id) {
+function _touchHeartbeatForTab(tab_id, presented_credential) {
   if (!tab_id) return false
   const w = workers.get(tab_id)
   if (!w) return false
-  // Proof of life outranks a death this process manufactured from silence.
-  _reviveIfManufacturedDeath(w)
+  // Proof of life outranks a death this process manufactured from silence, but
+  // only when the caller can prove it IS that tab. See the note on the helper.
+  _reviveIfManufacturedDeath(w, presented_credential)
   if (w.terminated_at) return false
   w.last_heartbeat_at = new Date().toISOString()
   try { atomicWriteJson(path.join(WORKERS_DIR, tab_id + '.json'), w) } catch (e) {}

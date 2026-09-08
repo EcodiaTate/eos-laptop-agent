@@ -145,7 +145,11 @@ app.post('/api/tool', auth, async (req, res) => {
       try {
         const coord = require('./tools/coord')
         if (typeof coord._touchHeartbeatForTab === 'function') {
-          coord._touchHeartbeatForTab(ctx.tab_id)
+          // 2026-09-09 lane coord-L1 VERIFY-2: pass the asserted credential so a
+          // manufactured death can be revived from this route too. Omitting it
+          // would silently make this the one path where proof of life is
+          // discarded, which is the exact shape e7ab40c was fixing.
+          coord._touchHeartbeatForTab(ctx.tab_id, ctx.tab_credential)
         }
       } catch (e) {}
     }

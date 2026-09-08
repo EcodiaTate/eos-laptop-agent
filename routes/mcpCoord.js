@@ -447,10 +447,16 @@ async function callTool(toolName, params, ctx) {
     // the explicit heartbeat handler, which already wrote. _touchHeartbeatForTab
     // refuses a row carrying terminated_at, so a late call cannot resurrect a
     // worker that already signalled done.
+    // 2026-09-09 lane coord-L1 VERIFY-2: the credential travels with the id.
+    // ctx.tab_id is ASSERTED, never authenticated (see extractCtx and the header
+    // note at the top of this file). While the touch only bumped a clock that
+    // was tolerable. Since e7ab40c the same call can also clear a manufactured
+    // terminated_at, so the revive half now demands the row's own credential.
+    // Passing it here does not gate the bump, only the revive.
     if (ctx && ctx.tab_id && short !== 'heartbeat') {
       try {
         if (typeof coord._touchHeartbeatForTab === 'function') {
-          coord._touchHeartbeatForTab(ctx.tab_id)
+          coord._touchHeartbeatForTab(ctx.tab_id, ctx.tab_credential)
         }
       } catch (e) {}
     }
