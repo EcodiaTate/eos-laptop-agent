@@ -3285,24 +3285,64 @@ async function ack_message(params, ctx) {
   return { ok: true, id: m.id, acknowledged_at: m.acknowledged_at }
 }
 
+// 2026-09-09 lane coord-L1. `dead` used to mean "stale heartbeat OR terminated",
+// and the staleness half made it a permanent FALSE ABSENCE: with the MCP heartbeat
+// wire dark (routes/mcpCoord.js, fixed the same commit) every worker's stale_ms was
+// simply its registration age, so every live worker crossed DEAD_HEARTBEAT_MS within
+// 90s and include_dead:false returned the empty set at all times. Matched pair
+// 2026-09-08T15:44Z: the call returned count 0 while three workers were demonstrably
+// live; one coord.heartbeat later the identical call returned that tab, dead:false.
+//
+// TWO CHANGES, and the second is the one that matters.
+//
+// 1. `dead` is now terminated_at ALONE, the signal the 2026-08-26 rule (status_board
+//    c020a13b) already named sound. Staleness keeps its own honest name,
+//    `heartbeat_stale`, so a caller that genuinely wants the age filter asks for it
+//    with max_stale_ms instead of getting it under a word that means death. The
+//    failure direction flips from false-absence to false-presence, which is the
+//    correct way round: the dangerous consumers (re-dispatch, worktree reaping) do
+//    damage when a live worker reads absent, never when a finished one lingers.
+//
+// 2. terminated_at HAS TWO PROVENANCES and the discriminator was recorded on the row
+//    but never returned. sweepStaleWorkers (~L4388) stamps terminated_at itself from
+//    heartbeat staleness ALONE, with terminated_reason 'stale_heartbeat'. So a rule
+//    that says "trust terminated_at, never staleness" is laundered the moment that
+//    sweep runs: the untrusted signal is manufactured into the trusted one. Measured
+//    2026-09-08 on 15 registry rows: 4 carried 'stale_heartbeat', and re-keying each
+//    tab to the transcript that OWNS it (worker-liveness OWNER_RE, not a bare id
+//    match, which attributes a conductor's mtime to every tab it names) at least 2 of
+//    those 4 wrote a transcript turn 3-4 minutes AFTER the stamp. They were alive
+//    when declared dead. terminated_reason and stale_at_termination_ms are returned
+//    now so a consumer can tell a real signal_done from a manufactured death.
 async function list_workers(params, ctx) {
   params = params || {}
   const include_dead = !!params.include_dead
+  // Opt-in staleness filter. Absent = no age filtering, which is the fix.
+  const maxStale = (typeof params.max_stale_ms === 'number' && params.max_stale_ms > 0)
+    ? params.max_stale_ms
+    : null
   const now = Date.now()
   const out = []
   for (const [tab_id, w] of workers.entries()) {
     const lastHbMs = new Date(w.last_heartbeat_at || w.registered_at).getTime()
     const stale_ms = now - lastHbMs
-    const is_dead = stale_ms > DEAD_HEARTBEAT_MS || !!w.terminated_at
+    const heartbeat_stale = stale_ms > DEAD_HEARTBEAT_MS
+    const is_dead = !!w.terminated_at
     if (is_dead && !include_dead) continue
+    if (maxStale !== null && stale_ms >= maxStale) continue
     out.push({
       tab_id: tab_id,
       task_id: w.task_id,
       registered_at: w.registered_at,
       last_heartbeat_at: w.last_heartbeat_at,
       stale_ms: stale_ms,
+      heartbeat_stale: heartbeat_stale,
       in_critical_section: !!w.in_critical_section,
       terminated_at: w.terminated_at,
+      // 'signal_done' / 'kill' = a real terminal event. 'stale_heartbeat' = the
+      // sweep manufactured this from heartbeat age and it is NOT proof of death.
+      terminated_reason: w.terminated_reason || null,
+      stale_at_termination_ms: w.stale_at_termination_ms || null,
       dead: is_dead,
     })
   }

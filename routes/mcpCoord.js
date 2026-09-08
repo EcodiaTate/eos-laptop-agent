@@ -134,11 +134,12 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'coord.list_workers',
-    description: 'List currently-registered worker tabs. include_dead=false (default) hides workers with stale heartbeats or terminated_at set.',
+    description: 'List currently-registered worker tabs. `dead` means terminated_at is set, and NOTHING ELSE: include_dead=false (default) hides exactly those. It no longer hides a worker on heartbeat age, which until 2026-09-09 made this call a permanent false absence (every live worker crossed the 90s staleness bound within two minutes of registering, so the default returned the empty set at all times). Heartbeat age is still reported, under its own honest name: `stale_ms` and `heartbeat_stale`. If you actually want an age filter, ask for it with max_stale_ms and pick your own threshold. READ terminated_reason BEFORE TREATING dead:true AS DEATH: terminated_at has two provenances. "signal_done"/"kill" is a real terminal event; "stale_heartbeat" means the 60-minute sweep manufactured it from heartbeat age alone, which is not proof of death (measured 2026-09-08, at least 2 of 4 such rows wrote a transcript turn minutes AFTER the stamp). stale_at_termination_ms carries the age that triggered such a sweep. For a hard liveness answer that does not depend on a worker remembering to heartbeat, use the transcript-mtime oracle in tools/worker-liveness.js.',
     inputSchema: {
       type: 'object',
       properties: {
-        include_dead: { type: 'boolean', default: false },
+        include_dead: { type: 'boolean', default: false, description: 'Include workers carrying terminated_at. Default false.' },
+        max_stale_ms: { type: 'number', description: 'Optional opt-in heartbeat-age filter: drop workers whose last_heartbeat_at is at least this old. Omit for no age filtering (the default, and the safe one - a live worker wrongly filtered out is what makes a consumer re-dispatch or reap it).' },
       },
       additionalProperties: true,
     },
@@ -425,6 +426,34 @@ async function callTool(toolName, params, ctx) {
   }
   try {
     const result = await Promise.resolve(handler(params || {}, ctx))
+    // 2026-09-09 lane coord-L1: THE HEARTBEAT WIRE, previously dark on this route.
+    // index.js:147 bumps last_heartbeat_at on any successful /api/tool call and
+    // SKIPS the coord.* family "to avoid double-write on the explicit heartbeat
+    // path". That reasoning assumed workers reach the agent over /api/tool. They
+    // do not: a dispatched Claude Code worker has no agent bearer, so its ONLY
+    // traffic here is coord.* over this JSON-RPC shim, and its Read/Bash/Edit
+    // calls never leave the IDE at all. So the one route a worker actually uses
+    // had no touch, and the one that had a touch excluded the only tools that
+    // route carries. Measured 2026-09-08: 15 of 15 registered workers carried
+    // last_heartbeat_at IDENTICAL to registered_at, including workers that ran
+    // 30+ minutes. That is not fleet non-compliance with the "heartbeat every
+    // turn" instruction; it is a wire that was never connected. The consequence
+    // was a permanent FALSE ABSENCE: every worker read stale within 90s
+    // (list_workers) and within 180s (scheduler STALE_WORKER_LIVENESS_MS), so
+    // the primary liveness gate answered "no live worker" for every live worker
+    // and only the transcript-mtime belt stood between that and a re-dispatch or
+    // a worktree delete.
+    // A coord call IS proof of life: the tab made it. Touch on every tool except
+    // the explicit heartbeat handler, which already wrote. _touchHeartbeatForTab
+    // refuses a row carrying terminated_at, so a late call cannot resurrect a
+    // worker that already signalled done.
+    if (ctx && ctx.tab_id && short !== 'heartbeat') {
+      try {
+        if (typeof coord._touchHeartbeatForTab === 'function') {
+          coord._touchHeartbeatForTab(ctx.tab_id)
+        }
+      } catch (e) {}
+    }
     return { isError: false, body: result }
   } catch (e) {
     return { isError: true, body: { error: e.message, tool: toolName } }
@@ -515,4 +544,8 @@ function mount(app, auth) {
   })
 }
 
-module.exports = { mount, TOOLS, SERVER_INFO, PROTOCOL_VERSION }
+// Test seam. callTool is the single place the MCP route reaches a handler, and
+// the 2026-09-09 heartbeat touch lives inside it, so a test that exercised the
+// handler directly would prove nothing about the wire. Exported so
+// coord-worker-liveness-flag.test.js can drive the REAL path.
+module.exports = { mount, TOOLS, SERVER_INFO, PROTOCOL_VERSION, _callToolForTest: callTool }
