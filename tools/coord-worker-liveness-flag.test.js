@@ -358,15 +358,28 @@ async function part1() {
   //     and that assertion is satisfied by the token sitting in prose, so a
   //     _composeBrief that stopped substituting would keep it green. This is the
   //     import-line failure named in [[the-pure-function-is-tested-the-wiring-is-grepped]].
-  const { _composeBrief } = require('./mac-dispatcher.js')
+  //     BOTH GENERATORS, because pinning one of two is the same defect as
+  //     testing one of three call sites. scheduler.js getDispatcher() defaults to
+  //     require('./cowork'), so cowork's builder is the LIVE dispatch path and
+  //     mac-dispatcher's is the other one; a pin on either alone leaves the fleet
+  //     able to go dark through the unpinned half. The loop idiom is the one
+  //     brief-conductor-attr.test.js already uses for exactly this reason.
   const CRED_SENTINEL = 'CRED-SENTINEL-2m-4f19ab'
-  const brief2m = _composeBrief({
-    tab_id: 'tab_2m_test', task_id: 'task-2m', tab_credential: CRED_SENTINEL,
-    conductor_inbox: 'chat.conductor.inbox', brief_storage: 'inline', brief_body: 'x' })
-  check(brief2m.includes(CRED_SENTINEL),
-    '2m the dispatched brief carries the credential VALUE, so a worker can present it')
-  check((brief2m.match(new RegExp(CRED_SENTINEL, 'g')) || []).length > 1,
-    '2m WHY not just the sentinel line: the coord CALL EXAMPLES carry it too, which is what a worker copies')
+  for (const [modName, modPath] of [['mac-dispatcher', './mac-dispatcher.js'], ['cowork', './cowork.js']]) {
+    const compose = require(modPath)._composeBrief
+    if (typeof compose !== 'function') {
+      check(false, '2m ' + modName + ' exposes _composeBrief so the credential can be asserted')
+      continue
+    }
+    const brief2m = compose({
+      tab_id: 'tab_2m_test', task_id: 'task-2m', tab_credential: CRED_SENTINEL,
+      parent_conductor_tab_id: 'conductor',
+      conductor_inbox: 'chat.conductor.inbox', brief_storage: 'inline', brief_body: 'x' })
+    check(brief2m.includes(CRED_SENTINEL),
+      '2m ' + modName + ': the dispatched brief carries the credential VALUE, so a worker can present it')
+    check((brief2m.match(new RegExp(CRED_SENTINEL, 'g')) || []).length > 1,
+      '2m ' + modName + ': and the coord CALL EXAMPLES carry it too, which is what a worker copies')
+  }
 
   // 2e. A NON-registered tab is a silent no-op, never a crash or a phantom row.
   const r5 = await mcp._callToolForTest('coord.list_channels', {}, { tab_id: 'tab_17888800000009_ffffffff' })
@@ -404,7 +417,9 @@ async function part1() {
 //   2j  coord.js _reviveIfManufacturedDeath: delete `if (!w.tab_credential) return false`
 //       and 2j goes red while both halves of 2i stay green - the two guards are
 //       separate rules and each has a fixture only it can fail.
-//   2m  tools/mac-dispatcher.js _composeBrief: replace the interpolated
+//   2m  EITHER generator's _composeBrief (tools/mac-dispatcher.js OR tools/cowork.js,
+//       and cowork is the LIVE one: scheduler.js getDispatcher() defaults to it):
+//       replace the interpolated
 //       `tab_credential` with the literal word (keep every mention, drop the
 //       substitution) and 2m goes red while brief-send-origin.test.js:71 stays
 //       GREEN, because that assertion checks the token and this one checks the
