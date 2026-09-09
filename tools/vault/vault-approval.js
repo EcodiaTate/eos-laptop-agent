@@ -133,7 +133,12 @@ const { execFileSync } = require('child_process')
 async function notifyDefault(target, msg) {
   if (target === 'tate') {
     try {
-      execFileSync('node', ['/Users/ecodia/.code/ecodiaos/backend/imessage-agent/text-tate.js', '--from', 'vault-approval', msg], { stdio: 'ignore' })
+      // process.execPath, NOT 'node'. vault-pull runs from launchd, whose default PATH
+      // is /usr/bin:/bin:/usr/sbin:/sbin and holds no node (ours is /opt/homebrew/bin/node).
+      // A bare 'node' ENOENTed here on every launchd fire, so the catch below logged a
+      // failure and returned via:'failed' and Tate was never texted. The comment above
+      // says never a silent swallow; under launchd this was one.
+      execFileSync(process.execPath, ['/Users/ecodia/.code/ecodiaos/backend/imessage-agent/text-tate.js', '--from', 'vault-approval', msg], { stdio: 'ignore' })
       return { via: 'imessage' }
     } catch (e) { console.log(`[notify:tate iMessage FAILED: ${e.message}] ${msg}`); return { via: 'failed' } }
   }
