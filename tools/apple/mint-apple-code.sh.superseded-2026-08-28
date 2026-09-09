@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# mint-apple-code.sh - generate a code@ Apple ID 2FA verification code on THIS
+# trusted Mac (signed into code@ecodia.au) and print ONLY the 6 digits to stdout.
+# The Apple equivalent of vault mint.js: Apple has no third-party TOTP, so the
+# code comes from the trusted-device "Get a verification code" affordance in
+# System Settings > Sign-In & Security. System Settings is accessibility-opaque
+# (every element reports no label), so navigation is by Vision OCR + CGEvent
+# click on the screenshot, never by AX name. Hard gate: a code is emitted ONLY
+# when the final sheet OCR contains "Verification Code", so a stray 6-digit
+# string on some other pane can never be returned as a code. Briefly takes focus.
+# Wire into apple-relogin.js to make ASC/Developer web login fully autonomous.
+#
+# BROKEN ON macOS 26.5.1, verified 2026-08-26, and deliberately NOT fixed in place: verifying a GUI
+# navigation fix needs a live 2FA challenge, and hammering the Apple login is worse than the bug.
+# Two separate breakages, both in step 3:
+#   1. The needle "Verification" is ambiguous. Sign-In & Security now carries an "Automatic
+#      Verification" row (the iCloud CAPTCHA-bypass setting) and OCR hits THAT first, so the script
+#      opens the wrong sheet, parses no digits, and exits "sheet open but no 6-digit code parsed".
+#      The hard gate is doing its job. The navigation is what is wrong.
+#   2. The code affordance moved a level deeper. It is no longer a row on Sign-In & Security. Path is
+#      now: Sign-In & Security -> the "Two-Factor Authentication" row -> the device row for THIS Mac.
+#      Confirm trust first: that sheet lists the Mac by name, and its device pane reads "This device
+#      is trusted and can receive Apple Account verification codes."
+# WORKING ALTERNATIVE, needs no GUI at all: the code also lands in this Mac's Messages database,
+# tagged __kIMOneTimeCodeAttributeName. Read ~/Library/Messages/chat.db. The `text` column is NULL on
+# modern macOS, so select hex(attributedBody) and unhexlify it.
+# Doctrine: an-absence-check-on-the-wrong-surface-manufactures-a-false-blocker-2026-08-26.
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink "$0" || echo "$0")")" && pwd)"
+S1="/tmp/apple-vc-$$-a.png"; S2="/tmp/apple-vc-$$-b.png"; S3="/tmp/apple-vc-$$-c.png"
+cleanup(){ rm -f "$S1" "$S2" "$S3" 2>/dev/null || true; osascript -e 'tell application "System Settings" to quit' >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+for b in ocrbox click screeninfo ocr; do
+  [ -x "$HERE/$b" ] || { echo "[mint-apple-code] missing helper $HERE/$b (compile the .swift files)" >&2; exit 3; }
+done
+SCALE=$("$HERE/screeninfo" | awk '{print $3}'); [ -n "$SCALE" ] || SCALE=2.0
+
+# find_click <shotfile> <needle>: OCR the shot, find first box whose text contains
+# needle (case-insensitive), click its centre in screen points. echo "hit"/"miss".
+find_click(){
+  local shot="$1" needle="$2"
+  "$HERE/ocrbox" "$shot" 2>/dev/null | awk -F'\t' -v n="$needle" -v s="$SCALE" '
+    BEGIN{ln=tolower(n)}
+    { t=tolower($1); if (index(t,ln)>0){ printf "%.0f %.0f\n", $2/s, $3/s; found=1; exit } }
+    END{ if(!found) print "MISS" }' > /tmp/apple-vc-$$-hit
+  local hit; hit=$(cat /tmp/apple-vc-$$-hit); rm -f /tmp/apple-vc-$$-hit
+  if [ "$hit" = "MISS" ] || [ -z "$hit" ]; then echo "miss"; return 1; fi
+  "$HERE/click" $hit >/dev/null 2>&1
+  echo "hit"
+}
+
+# 1. open Apple ID settings, focus
+osascript -e 'tell application "System Settings" to activate' \
+          -e 'delay 0.6' \
+          -e 'open location "x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings"' >/dev/null 2>&1
+sleep 3
+
+# 2. click Sign-In & Security (match "Sign-In" then fall back to "Security")
+screencapture -x -o "$S1"
+if [ "$(find_click "$S1" "Sign-In")" != "hit" ]; then find_click "$S1" "Security" >/dev/null || true; fi
+sleep 2.5
+
+# 3. click Get a Verification Code (match "Verification")
+screencapture -x -o "$S2"
+find_click "$S2" "Verification" >/dev/null || true
+sleep 2.5
+
+# 4. read the code from the sheet - ONLY if the sheet text confirms it
+screencapture -x -o "$S3"
+OCRTXT=$("$HERE/ocr" "$S3" 2>/dev/null || true)
+if ! printf '%s' "$OCRTXT" | tr 'A-Z' 'a-z' | grep -q 'verification'; then
+  echo "[mint-apple-code] the verification-code sheet did not open (no 'Verification' text on screen). System Settings layout may have shifted; re-inspect." >&2
+  printf '%s\n' "$OCRTXT" | sed 's/[0-9]/#/g' | head -15 >&2
+  exit 1
+fi
+CODE=$(printf '%s' "$OCRTXT" | tr -d ' ' | grep -oE '[0-9]{6}' | head -1 || true)
+[ -n "$CODE" ] || CODE=$(printf '%s' "$OCRTXT" | grep -oE '[0-9]{6}' | head -1 || true)
+if [ -z "$CODE" ]; then echo "[mint-apple-code] sheet open but no 6-digit code parsed" >&2; exit 1; fi
+echo "$CODE"

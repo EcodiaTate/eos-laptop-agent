@@ -338,40 +338,79 @@ async function main() {
 
     const BUDGET = parseInt(process.env.SCHEDULER_SIGNAL_BOUND_TIMEOUT_MS, 10)
 
-    // D1: a legitimate bind. The lock must RELEASE well inside the budget.
-    const d1 = await runDispatch('tab_d1', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_d1' }))
-    const d1ms = d1.waitMs
-    r = await row()
-    ok(d1ms < BUDGET, 'D1. RELEASES: a bind from the dispatched tab ends the wait early (' + d1ms + 'ms of ' + BUDGET + 'ms)')
+    // ── THE RELEASE LEGS ARE MEASURED AGAINST THIS RUN'S OWN HOLD, NOT THE CLOCK ─
+    //
+    // 2026-08-29, eighth worker on lane R1. D1 and D9 used to assert
+    // `elapsed < BUDGET` against a fixed number, and wall clock cannot tell a
+    // released lock from a stalled query. The budget was raised 3000 -> 6000 one
+    // arc earlier to buy headroom, which helped and did not fix the shape: a
+    // stall longer than the budget still reads as a held lock, and the previous
+    // arc could not close it because both of its runs were clean and there was no
+    // failing signal to build against.
+    //
+    // The fix is to stop measuring an absolute at all. A pooler stall is ADDITIVE
+    // and it lands on every case in the run alike: with a stall of S, the release
+    // costs R + S and the hold costs BUDGET + S. The RATIO of the two degrades
+    // toward 1 as S grows, so a ratio test is still fragile. The DIFFERENCE is
+    // stall-invariant by construction:
+    //
+    //     hold - release = (BUDGET + S) - (R + S) = BUDGET - R
+    //
+    // and that identity holds for any S. So D5's no-bind wait is measured FIRST
+    // as this run's own full-budget baseline, on the same pooler, seconds apart,
+    // and D1 and D9 then assert that they finished a HALF BUDGET sooner than it.
+    // A stall that inflates everything by nine seconds moves neither side of that
+    // comparison. A release path that has genuinely stopped releasing collapses
+    // the difference to zero and goes red, which is the leg's whole purpose.
+    //
+    // All four cases are measured before any leg is asserted, purely so the
+    // baseline exists when D1 is judged; the printed order is unchanged and the
+    // leg ids still mean what the breakage tables in the handovers say they mean.
+    const HOLD_MARGIN = Math.round(BUDGET * 0.5)
+    const dCase = {}
+    async function measureD(key, tabId, binder) {
+      const res = await runDispatch(tabId, binder)
+      dCase[key] = { ms: res.waitMs, row: await row() }
+    }
+    // D5 first: it is the baseline the release legs are judged against.
+    await measureD('d5', 'tab_d5', null)
+    await measureD('d1', 'tab_d1', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_d1' }))
+    await measureD('d7', 'tab_d7', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_an_impostor' }))
+    await measureD('d9', 'tab_d9', () => coord.signal_done(
+      { task_id: taskId, status: 'success', result_summary: 'finished before binding' },
+      { tab_id: 'tab_d9' }))
+    const d1ms = dCase.d1.ms, d5ms = dCase.d5.ms, d7ms = dCase.d7.ms, d9ms = dCase.d9.ms
+    const showD = (ms) => ms + 'ms vs hold ' + d5ms + 'ms, delta ' + (d5ms - ms) + 'ms, need ' + HOLD_MARGIN + 'ms'
+
+    // D1: a legitimate bind. The lock must RELEASE a half budget sooner than the
+    // no-bind hold measured moments ago on this same pooler.
+    r = dCase.d1.row
+    ok(d5ms - d1ms >= HOLD_MARGIN, 'D1. RELEASES: a bind from the dispatched tab ends the wait early (' + showD(d1ms) + ')')
     ok(!!r.bound_at, 'D2. the bind actually landed on the row')
     ok(r.status === 'running', 'D3. the row reached status=running')
     ok(r.dispatched_tab_id === 'tab_d1', 'D4. the row names the tab that was spawned')
 
     // D5: NO bind at all. The lock must NOT release: the wait runs its budget.
     // This is the direction a one-sided gate cannot see. Without it, a lock that
-    // never engages at all scores identically to a working handshake.
-    const d5ms = (await runDispatch('tab_d5', null)).waitMs
-    r = await row()
+    // never engages at all scores identically to a working handshake. This one
+    // stays absolute on purpose: a stall can only ever INFLATE a hold, never cut
+    // it short, so `>= BUDGET` has no false-red mode to fix.
+    r = dCase.d5.row
     ok(d5ms >= BUDGET, 'D5. DOES NOT RELEASE: with no bind the wait runs its full budget (' + d5ms + 'ms of ' + BUDGET + 'ms)')
     ok(r.bound_at === null, 'D6. ABSENCE: bound_at stayed NULL through the whole wait')
 
     // D7: a bind from the WRONG tab, arriving during the wait. This separates
     // "the handshake works" from "the guard works". An unguarded sink releases
     // the lock here, and every other leg in this gate would still be green.
-    const d7ms = (await runDispatch('tab_d7', () => coord.signal_bound({ task_id: taskId }, { tab_id: 'tab_an_impostor' }))).waitMs
-    r = await row()
+    r = dCase.d7.row
     ok(d7ms >= BUDGET, 'D7. DOES NOT RELEASE on a bind from a tab that does not own the row (' + d7ms + 'ms of ' + BUDGET + 'ms)')
     ok(r.bound_at === null, 'D8. ABSENCE: the impostor bind did not stamp the row')
 
     // D9: the fast worker. A done that arrives without a bound must still end the
     // wait AND complete the row inline. Losing this case rotted rows at running
     // until the 6h orphan sweep through all of July.
-    const d9 = await runDispatch('tab_d9', () => coord.signal_done(
-      { task_id: taskId, status: 'success', result_summary: 'finished before binding' },
-      { tab_id: 'tab_d9' }))
-    const d9ms = d9.waitMs
-    r = await row()
-    ok(d9ms < BUDGET, 'D9. a done without a bound ends the wait early (' + d9ms + 'ms of ' + BUDGET + 'ms)')
+    r = dCase.d9.row
+    ok(d5ms - d9ms >= HOLD_MARGIN, 'D9. a done without a bound ends the wait early (' + showD(d9ms) + ')')
     ok(r.status === 'completed', 'D10. and the row is completed inline, not left running for the orphan sweep')
 
     creds.pick_healthiest_account = origPick

@@ -104,10 +104,30 @@ async function injectToChrome(cookies, opts = {}) {
   const cdp = opts.cdp || require('../cdp.js')
   const urlContains = opts.urlContains || 'google.com'
   const verifyUrl = opts.verifyUrl || 'https://myaccount.google.com/'
-  const target = { urlContains }
+  let target = { urlContains }
   // Ensure a live page on the origin exists so the cookie writes have context and
   // so the reload afterwards actually re-authenticates.
-  try { await cdp.navigate(Object.assign({}, target, { url: verifyUrl })) } catch (_e) {}
+  //
+  // AMBIGUITY (2026-08-29): the default needle 'google.com' matches EVERY google
+  // tab, and several are normally open at once in the fleet-shared canonical
+  // Chrome (mail.google.com + calendar.google.com were both live when this was
+  // written). resolveTarget now REFUSES a non-unique needle rather than silently
+  // coin-flipping, so this call site has to say which tab it wants. Here, and
+  // only here, ANY match is equally correct: CDP cookie writes go to the browser
+  // context, not to a tab, so the tab is just somewhere to stand. Pin the first
+  // candidate by explicit targetId. That structured catch-and-pin is the
+  // sanctioned two-step; it is deliberately not a general allowAmbiguous flag.
+  const _pin = (e) => {
+    if (e && e.code === 'AMBIGUOUS_TARGET' && e.candidates && e.candidates.length) {
+      target = { targetId: e.candidates[0].targetId }
+      return true
+    }
+    return false
+  }
+  try { await cdp.navigate(Object.assign({}, target, { url: verifyUrl })) }
+  catch (e) {
+    if (_pin(e)) { try { await cdp.navigate(Object.assign({}, target, { url: verifyUrl })) } catch (_e2) {} }
+  }
   const set = []
   const failed = []
   for (const c of cookies) {
